@@ -1,50 +1,12 @@
 
-import numpy as np
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from utils.quaternion import quaternion_to_rotation_matrix
+import numpy as np
 
-@dataclass
-class ImuMeasurement:
-	timestamp: float
-	acceleration: np.ndarray
-	angular_velocity: np.ndarray
-
-@dataclass
-class ImageMeasurement:
-	timestamp: float
-	frameIndex: int
-	left_image_path: Path
-	right_image_path: Path
-
-@dataclass
-class LidarMeasurement:
-	timestamp: float
-	frameIndex: int
-	scan_path: Path
-
-@dataclass
-class LidarExtrinsics:
-    rotation_bl: np.ndarray
-    translation_bl: np.ndarray
-
-    def __post_init__(self) -> None:
-        self.rotation_bl = np.asarray(
-            self.rotation_bl,
-            dtype=np.float64,
-        ).reshape(3, 3)
-
-        self.translation_bl = np.asarray(
-            self.translation_bl,
-            dtype=np.float64,
-        ).reshape(3)
-
-SensorMeasurement = (
-	ImuMeasurement
-	| LidarMeasurement
-	| ImageMeasurement
-)
+from sensors.measurements import (ImageMeasurement,
+								  ImuMeasurement,
+								  LidarMeasurement,
+								  SensorMeasurement)
 
 class SensorHandler:
 	def __init__(self, sequence_path: str):
@@ -219,7 +181,7 @@ class SensorHandler:
 			measurements.append(
 				ImageMeasurement(
 					timestamp=float(timestamp),
-					frameIndex=index,
+					frame_index=index,
 					left_image_path=left_path,
 					right_image_path=right_path,
 				)
@@ -246,7 +208,7 @@ class SensorHandler:
 		return [
 			LidarMeasurement(
 				timestamp=float(timestamp),
-				frameIndex=index,
+				frame_index=index,
 				scan_path=scan_path,
 			)
 			for index, (
