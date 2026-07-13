@@ -24,6 +24,8 @@ class LiveOsmTrajectoryPlotter:
 		self.alignment_done = False
 		self.minimum_alignment_points = 2
 		self.local_displacements_xy: list[np.ndarray] = []
+		self.map_matched_xy_utm: list[np.ndarray] = []
+
 
 		if not geojson_path.exists():
 			raise FileNotFoundError(
@@ -80,6 +82,25 @@ class LiveOsmTrajectoryPlotter:
 
 		self.figure, self.axis = plt.subplots(
 			figsize=(12, 10)
+		)
+
+		(
+		self.map_matched_line,
+		) = self.axis.plot(
+			[],
+			[],
+			linewidth=2.5,
+			label="Map-matched trajectory",
+		)
+		(
+			self.map_matched_marker,
+		) = self.axis.plot(
+			[],
+			[],
+			marker="o",
+			markersize=8,
+			linestyle="None",
+			label="Map-matched pose",
 		)
 
 		self.roads_metric.plot(
@@ -143,6 +164,41 @@ class LiveOsmTrajectoryPlotter:
 		plt.show(
 			block=False
 		)
+
+	def update_map_matched(
+		self,
+		corrected_xy_utm: np.ndarray,
+	) -> None:
+		corrected_xy_utm = np.asarray(
+			corrected_xy_utm,
+			dtype=np.float64,
+		).reshape(2)
+
+		self.map_matched_xy_utm.append(
+			corrected_xy_utm.copy()
+		)
+
+		trajectory = np.asarray(
+			self.map_matched_xy_utm,
+			dtype=np.float64,
+		).reshape(-1, 2)
+
+		self.map_matched_line.set_data(
+			trajectory[:, 0],
+			trajectory[:, 1],
+		)
+
+		self.map_matched_marker.set_data(
+			[
+				corrected_xy_utm[0],
+			],
+			[
+				corrected_xy_utm[1],
+			],
+		)
+
+		self.figure.canvas.draw()
+		self.figure.canvas.flush_events()
 
 	def _geodetic_to_metric_xy(
 		self,
@@ -287,7 +343,7 @@ class LiveOsmTrajectoryPlotter:
 	def update(
 		self,
 		local_position_w: np.ndarray,
-	) -> None:
+	) -> np.ndarray:
 		utm_xy = self.local_to_utm(
 			local_position_w
 		)
@@ -315,13 +371,28 @@ class LiveOsmTrajectoryPlotter:
 			],
 		)
 
-		# Keep the view around the trajectory and OSM start.
+		# Keep the view around the trajectory, OSM start,
+		# and optionally map-matched trajectory.
 		all_points = np.vstack(
 			(
 				trajectory,
 				self.start_xy_utm.reshape(1, 2),
 			)
 		)
+
+		if hasattr(self, "map_matched_xy_utm"):
+			if len(self.map_matched_xy_utm) > 0:
+				map_matched_trajectory = np.asarray(
+					self.map_matched_xy_utm,
+					dtype=np.float64,
+				).reshape(-1, 2)
+
+				all_points = np.vstack(
+					(
+						all_points,
+						map_matched_trajectory,
+					)
+				)
 
 		margin = 40.0
 
@@ -337,6 +408,8 @@ class LiveOsmTrajectoryPlotter:
 
 		self.figure.canvas.draw()
 		self.figure.canvas.flush_events()
+
+		return utm_xy
 
 	def close(
 		self,

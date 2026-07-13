@@ -1,18 +1,5 @@
 """
-Implementation goals:
 
-A. Finish IMU propagation                         done
-B. Implement LiDAR scan loader                    done
-C. Add LiDAR/body/camera calibration transforms   done
-D. Build simple local point-cloud map             done
-E. Implement nearest-neighbor plane fitting       done
-F. Implement point-to-plane residual/Jacobian     in progress
-G. Implement iterated LiDAR ESIKF update          next
-H. Verify covariance shrinks after LiDAR update
-I. Add image projection of map points
-J. Store reference image patches
-K. Implement photometric residual
-L. Implement sequential visual update
 """
 
 from pathlib import Path
@@ -61,6 +48,12 @@ from map_matching.visualization.osm_plotter import (
 	rotation_matrix_2d
 )
 
+from map_matching.algorithms.road_segment_matcher import (
+	RoadSegmentMatcher,
+	estimate_heading_from_last_positions,
+	load_road_segments_from_geojson,
+)
+
 
 SEQUENCE_PATH = Path(
 	"/Users/ekremserdarozturk/Desktop/"
@@ -82,9 +75,6 @@ def main() -> None:
 	lidar_quaternions_wb: list[np.ndarray] = []
 
 
-	# =========================================================
-	# 1. SENSOR INPUT
-	#=========================================================
 	sensor_handler = SensorHandler(
 		SEQUENCE_PATH
 	)
@@ -93,14 +83,10 @@ def main() -> None:
 		SEQUENCE_PATH
 	)
 
-	# =========================================================
-	# 2. STATE ESTIMATOR
-	# =========================================================
+	# initialize state estimator
 	esikf = ESIKF()
 
-	# =========================================================
-	# 3. LIDAR PREPROCESSING
-	# =========================================================
+	# Lidar data processing
 	lidar_processor = LidarProcessor(
 		minimum_range=2.0,
 		maximum_range=80.0,
@@ -109,20 +95,9 @@ def main() -> None:
 		voxel_size=0.25,
 	)
 
-    # =========================================================
-    # 4. CALIBRATION
-    # =========================================================
-    # LiDAR/Velodyne -> IMU/body.
-    #
-    # This is used now for the LiDAR scan-to-map update.
 	lidar_to_body = (
 		create_kitti_lidar_to_imu()
 	)
-
-    # LiDAR/Velodyne -> camera.
-    #
-    # This is not used yet. It will later be used for
-    # projecting map/LiDAR points into the camera image.
 	lidar_to_camera = (
 		create_kitti_lidar_to_camera()
 	)
@@ -140,16 +115,11 @@ def main() -> None:
 		lidar_to_camera is not None,
 	)
 
-	# =========================================================
-	# 5. LOCAL WORLD-FRAME MAP
-	# =========================================================
 	local_map = LocalMap(
 		maximum_points=200_000
 	)
 
-	# =========================================================
-	# 6. VISUALIZATION
-	# =========================================================
+	# visualization
 	lidar_viewer = LidarViewer(
 		window_name="LiDAR local map",
 		width=1280,
@@ -178,6 +148,27 @@ def main() -> None:
 		start_latitude=first_latitude,
 		start_longitude=first_longitude,
 	)
+
+	# Introduce the map mathcing algos here
+	road_segments, roads_metric = load_road_segments_from_geojson(
+		geojson_path=OSM_PATH,
+		target_crs="EPSG:32632",
+	)
+
+	road_matcher = RoadSegmentMatcher(
+		segments=road_segments,
+		search_radius=35.0,
+		sigma_distance=5.0,
+		sigma_heading=np.deg2rad(25.0),
+		position_correction_alpha=0.6,
+		heading_correction_beta=0.4,
+	)
+
+	lidar_positions_xy_utm: list[np.ndarray] = []
+	map_matched_positions_xy_utm: list[np.ndarray] = []
+	map_matched_headings: list[float] = []
+	map_matching_distances: list[float] = []
+	map_matching_costs: list[float] = []
 
 	# Get real world orientation using OXTS lat and long
 	oxts_latitudes, oxts_longitudes = (
@@ -226,9 +217,7 @@ def main() -> None:
 
 	try:
 		for measurement in sensor_handler:
-			# =================================================
-			# IMU PREDICTION
-			# =================================================
+			# IMU propagation
 			if isinstance(
 				measurement,
 				ImuMeasurement,
@@ -237,23 +226,15 @@ def main() -> None:
 					measurement
 				)
 
-			# =================================================
-			# LIDAR UPDATE
-			# =================================================
+			# measurement update
 			elif isinstance(
 				measurement,
 				LidarMeasurement,
 			):
-				# ---------------------------------------------
-				# 1. Read the raw LiDAR scan.
-				# ---------------------------------------------
 				raw_scan = lidar_reader.load_scan(
 					measurement
 				)
 
-				# ---------------------------------------------
-				# 2. Range filtering and voxel downsampling.
-				# ---------------------------------------------
 				processed_scan = (
 					lidar_processor.process(
 						raw_scan
@@ -274,28 +255,14 @@ def main() -> None:
 					lidar_frame_index += 1
 					continue
 
-				# ---------------------------------------------
-				# 3. Convert the LiDAR points into body/IMU
-				#    coordinates using the fixed calibration.
-				#
-				#    p_B = R_BL p_L + t_BL
-				# ---------------------------------------------
+
 				points_b = (
 					lidar_to_body.transform_points(
 						points_l
 					)
 				)
 
-				# ---------------------------------------------
 				# 4. Preserve the state produced only by IMU
-				#    propagation.
-				#
-				# These copies are useful for debugging and
-				# later visualization of:
-				#
-				# red   = IMU-only prediction
-				# green = LiDAR-corrected state
-				# ---------------------------------------------
 				imu_predicted_quaternion = (
 					esikf.state.quaternion_wb.copy()
 				)
@@ -310,12 +277,7 @@ def main() -> None:
 					)
 				)
 
-				# ---------------------------------------------
-				# 5. Transform scan using the IMU-predicted
-				#    pose.
-				#
-				#    p_W = R_WB p_B + p_WB
-				# ---------------------------------------------
+				# Transform scan using the IMU-predicted
 				imu_predicted_points_w = (
 					transform_body_to_world(
 						points_b=points_b,
@@ -328,9 +290,6 @@ def main() -> None:
 					)
 				)
 
-				# =============================================
-				# FIRST LIDAR SCAN
-				# =============================================
 				if local_map.is_empty():
 					# There is no existing map with which the
 					# first scan can be compared.
@@ -346,9 +305,6 @@ def main() -> None:
 						f"{len(local_map)} points"
 					)
 
-					# At this point there is no LiDAR pose
-					# correction. The corrected pose is equal
-					# to the IMU-predicted pose.
 					corrected_quaternion = (
 						imu_predicted_quaternion.copy()
 					)
@@ -361,7 +317,6 @@ def main() -> None:
 						imu_predicted_points_w
 					)
 
-					# Add the correction points to showcase the results
 					lidar_timestamps.append(
 						float(measurement.timestamp)
 					)
@@ -374,13 +329,8 @@ def main() -> None:
 						corrected_quaternion.copy()
 					)
 
-				# =============================================
-				# SECOND AND LATER LIDAR SCANS
-				# =============================================
 				else:
-					# Use only part of the scan to estimate
-					# pose. The complete scan will be
-					# transformed after correction.
+
 					update_points_b = points_b[::5]
 
 					print(
@@ -392,19 +342,6 @@ def main() -> None:
 						imu_predicted_position,
 					)
 
-					# -----------------------------------------
-					# Iterated scan-to-map point-to-plane
-					# correction.
-					#
-					# This should:
-					#
-					# 1. transform points with current pose;
-					# 2. find map neighbours;
-					# 3. fit local planes;
-					# 4. calculate residuals/Jacobians;
-					# 5. solve a six-dimensional correction;
-					# 6. repeat with the corrected pose.
-					# -----------------------------------------
 					(
 						corrected_quaternion,
 						corrected_position,
@@ -457,17 +394,65 @@ def main() -> None:
 					)
 
 					#update the map visualization
-					osm_plotter.update(
+					lidar_xy_utm = osm_plotter.update(
 						corrected_position
 					)
 
-					# -----------------------------------------
-					# 6. Inject the corrected pose into the
-					#    nominal state.
-					#
-					# This is currently a pose-only correction.
-					# It does not yet update the covariance.
-					# -----------------------------------------
+
+					lidar_positions_xy_utm.append(
+						lidar_xy_utm.copy()
+					)
+
+					vehicle_heading_utm = estimate_heading_from_last_positions(
+						lidar_positions_xy_utm,
+						minimum_displacement=0.5,
+					)
+
+					match_result = road_matcher.match_and_correct(
+						vehicle_xy=lidar_xy_utm,
+						vehicle_heading=vehicle_heading_utm,
+					)
+
+					if match_result.matched:
+						map_matched_positions_xy_utm.append(
+							match_result.corrected_xy.copy()
+						)
+						map_matched_headings.append(
+							match_result.corrected_heading
+						)
+						map_matching_distances.append(
+							match_result.distance
+						)
+						map_matching_costs.append(
+							match_result.cost
+						)
+						osm_plotter.update_map_matched(
+							match_result.corrected_xy
+						)
+						print(
+							"[MAP MATCH]",
+							"distance:",
+							f"{match_result.distance:.2f}",
+							"lateral:",
+							f"{match_result.lateral_residual:.2f}",
+							"heading error deg:",
+							f"{np.rad2deg(match_result.heading_error):.2f}",
+							"cost:",
+							f"{match_result.cost:.2f}",
+						)
+
+					else:
+						map_matched_positions_xy_utm.append(
+							lidar_xy_utm.copy()
+						)
+						osm_plotter.update_map_matched(
+							lidar_xy_utm
+						)
+						print(
+							"[MAP MATCH] no road matched"
+						)
+
+
 					esikf.state.quaternion_wb = (
 						corrected_quaternion.copy()
 					)
@@ -476,10 +461,6 @@ def main() -> None:
 						corrected_position.copy()
 					)
 
-					# -----------------------------------------
-					# 7. Transform the complete scan again,
-					#    this time using the corrected pose.
-					# -----------------------------------------
 					corrected_rotation_wb = (
 						quaternion_to_rotation_matrix(
 							corrected_quaternion
@@ -498,27 +479,10 @@ def main() -> None:
 						)
 					)
 
-					# -----------------------------------------
-					# 8. Insert only LiDAR-corrected points.
-					#
-					# Do not insert imu_predicted_points_w,
-					# because those points may contain drift.
-					# -----------------------------------------
 					local_map.add_points(
 						corrected_points_w[::5]
 					)
 
-				# =============================================
-				# VISUALIZATION
-				# =============================================
-				# Display:
-				#
-				# - the accumulated corrected map;
-				# - the current corrected ESIKF state.
-				#
-				# Your existing viewer accepts only one state.
-				# Therefore, it currently displays the
-				# corrected pose, not both poses.
 				display_points_w = (
 					local_map.points_w
 				)
@@ -535,20 +499,10 @@ def main() -> None:
 
 				lidar_frame_index += 1
 
-			# =================================================
-			# CAMERA UPDATE — LATER
-			# =================================================
 			elif isinstance(
 				measurement,
 				ImageMeasurement,
 			):
-				# Later:
-				#
-				# 1. select visible map points;
-				# 2. transform world points to camera;
-				# 3. project them into the image;
-				# 4. calculate photometric residuals;
-				# 5. perform sequential visual update.
 				pass
 
 	finally:
