@@ -5,6 +5,9 @@
 from pathlib import Path
 
 import numpy as np
+import cv2
+
+from sensors.camera.camera_reader import combineImages
 
 from estimation.esikf import ESIKF
 from estimation.lidar_update import (
@@ -329,6 +332,9 @@ def main() -> None:
 						corrected_quaternion.copy()
 					)
 
+					# Showcased the local map
+
+
 				else:
 
 					update_points_b = points_b[::5]
@@ -503,7 +509,12 @@ def main() -> None:
 				measurement,
 				ImageMeasurement,
 			):
-				pass
+				# only show the images here
+				combinedImage = combineImages(measurement)
+				cv2.imshow("combinedImage", combinedImage)
+
+				# cv2.waitKey(1)
+
 
 	finally:
 		# path save
@@ -543,6 +554,7 @@ def main() -> None:
 
 			lidar_viewer.close()
 			osm_plotter.close()
+			cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

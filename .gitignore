@@ -1,5 +1,12 @@
 /.venv
 /.vscode
-src/__pycache__
-utils/__pycache__
+
+.DS_Store
+
 outputs
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+/.-m/
