@@ -274,36 +274,36 @@ class LiveOsmTrajectoryPlotter:
 				utm_xy.copy()
 			)
 
-		print(
-			"Yaw alignment done."
-		)
+		# print(
+		# 	"Yaw alignment done."
+		# )
 
-		print(
-			"  OXTS heading [deg]:",
-			float(
-				np.rad2deg(
-					self.oxts_heading
-				)
-			),
-		)
+		# print(
+		# 	"  OXTS heading [deg]:",
+		# 	float(
+		# 		np.rad2deg(
+		# 			self.oxts_heading
+		# 		)
+		# 	),
+		# )
 
-		print(
-			"  LIO heading [deg]:",
-			float(
-				np.rad2deg(
-					lio_heading
-				)
-			),
-		)
+		# print(
+		# 	"  LIO heading [deg]:",
+		# 	float(
+		# 		np.rad2deg(
+		# 			lio_heading
+		# 		)
+		# 	),
+		# )
 
-		print(
-			"  yaw correction [deg]:",
-			float(
-				np.rad2deg(
-					yaw_correction
-				)
-			),
-		)
+		# print(
+		# 	"  yaw correction [deg]:",
+		# 	float(
+		# 		np.rad2deg(
+		# 			yaw_correction
+		# 		)
+		# 	),
+		# )
 
 	def local_to_utm(
 		self,

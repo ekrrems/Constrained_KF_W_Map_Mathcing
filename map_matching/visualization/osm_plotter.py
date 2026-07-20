@@ -91,8 +91,8 @@ def plot_osm_roads(
 			"The GeoJSON contains no road features."
 		)
 
-	print("Road features:", len(roads))
-	print("Original CRS:", roads.crs)
+	# print("Road features:", len(roads))
+	# print("Original CRS:", roads.crs)
 
 	if use_metric_coordinates:
 		metric_crs = roads.estimate_utm_crs()
@@ -106,10 +106,10 @@ def plot_osm_roads(
 			metric_crs
 		)
 
-		print(
-			"Projected CRS:",
-			roads.crs,
-		)
+		# print(
+		# 	"Projected CRS:",
+		# 	roads.crs,
+		# )
 
 		x_label = "Easting [m]"
 		y_label = "Northing [m]"
@@ -199,16 +199,16 @@ def plot_osm_roads_with_car_start(
 		raise ValueError(
 			"The GeoJSON contains no road features."
 		)
-	print("Road features:", len(roads))
-	print("Original CRS:", roads.crs)
+	# print("Road features:", len(roads))
+	# print("Original CRS:", roads.crs)
 	first_latitude, first_longitude, first_altitude = (
 		read_first_oxts_position(
 			sequence_path
 		)
 	)
-	print("First OXTS latitude:", first_latitude)
-	print("First OXTS longitude:", first_longitude)
-	print("First OXTS altitude:", first_altitude)
+	# print("First OXTS latitude:", first_latitude)
+	# print("First OXTS longitude:", first_longitude)
+	# print("First OXTS altitude:", first_altitude)
 	if use_metric_coordinates:
 		metric_crs = roads.estimate_utm_crs()
 		if metric_crs is None:
@@ -218,19 +218,19 @@ def plot_osm_roads_with_car_start(
 		roads = roads.to_crs(
 			metric_crs
 		)
-		print(
-			"Projected CRS:",
-			roads.crs,
-		)
+		# print(
+		# 	"Projected CRS:",
+		# 	roads.crs,
+		# )
 		car_start_xy = geodetic_to_metric_xy(
 			latitude=first_latitude,
 			longitude=first_longitude,
 			target_crs=roads.crs,
 		)
-		print(
-			"Car start UTM position:",
-			car_start_xy,
-		)
+		# print(
+		# 	"Car start UTM position:",
+		# 	car_start_xy,
+		# )
 		x_label = "Easting [m]"
 		y_label = "Northing [m]"
 	else:

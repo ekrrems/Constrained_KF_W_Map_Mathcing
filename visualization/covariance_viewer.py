@@ -1,5 +1,9 @@
 import cv2
 import numpy as np
+from matplotlib.patches import Ellipse
+import matplotlib.pyplot as plt
+import numpy as np
+
 
 def showTopDownTrajectory(
 	self,
@@ -263,3 +267,113 @@ def showTopDownTrajectory(
 		return False
 
 	return True
+
+
+def plot_trajectory_with_covariance(
+    positions_w: np.ndarray,
+    covariances: np.ndarray,
+    ellipse_interval: int = 10,
+) -> None:
+	positions_w = np.asarray(
+		positions_w,
+		dtype=np.float64,
+	)
+
+	covariances = np.asarray(
+		covariances,
+		dtype=np.float64,
+	)
+
+	figure, axis = plt.subplots(
+		figsize=(10, 8)
+	)
+
+	axis.plot(
+		positions_w[:, 0],
+		positions_w[:, 1],
+		color="black",
+		linewidth=1.5,
+		label="LiDAR-IMU trajectory",
+	)
+
+	# sqrt(chi-square(2 DoF, 95%))
+	confidence_scale = 2.4477
+
+	for frame_index in range(
+		0,
+		len(positions_w),
+		ellipse_interval,
+	):
+		position_xy = positions_w[
+			frame_index,
+			0:2,
+		]
+
+		# Position is located at error-state indices 3:6.
+		covariance_xy = covariances[
+			frame_index,
+			3:5,
+			3:5,
+		]
+
+		eigenvalues, eigenvectors = np.linalg.eigh(
+			covariance_xy
+		)
+
+		eigenvalues = np.maximum(
+			eigenvalues,
+			0.0,
+		)
+
+		order = np.argsort(
+			eigenvalues
+		)[::-1]
+
+		eigenvalues = eigenvalues[order]
+		eigenvectors = eigenvectors[:, order]
+
+		major_direction = eigenvectors[:, 0]
+
+		angle_deg = np.degrees(
+			np.arctan2(
+				major_direction[1],
+				major_direction[0],
+			)
+		)
+
+		width = (
+			2.0
+			* confidence_scale
+			* np.sqrt(eigenvalues[0])
+		)
+
+		height = (
+			2.0
+			* confidence_scale
+			* np.sqrt(eigenvalues[1])
+		)
+
+		ellipse = Ellipse(
+			xy=position_xy,
+			width=width,
+			height=height,
+			angle=angle_deg,
+			fill=False,
+			edgecolor="tab:blue",
+			alpha=0.6,
+			linewidth=1.0,
+		)
+
+		axis.add_patch(ellipse)
+
+	axis.set_xlabel("World X [m]")
+	axis.set_ylabel("World Y [m]")
+	axis.set_title(
+		"Trajectory with 95% position covariance"
+	)
+	axis.axis("equal")
+	axis.grid(True, alpha=0.3)
+	axis.legend()
+
+	figure.tight_layout()
+	plt.show()

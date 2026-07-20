@@ -39,6 +39,7 @@ from sensors.sensor_handler import SensorHandler
 from visualization.lidar_viewer import (
 	LidarViewer,
 )
+from visualization.covariance_viewer import plot_trajectory_with_covariance
 
 from map_matching.visualization.live_osm_plotter import (
 	LiveOsmTrajectoryPlotter,
@@ -87,7 +88,7 @@ def main() -> None:
 	)
 
 	# initialize state estimator
-	esikf = ESIKF()
+	esikf = ESIKF(SEQUENCE_PATH)
 
 	# Lidar data processing
 	lidar_processor = LidarProcessor(
@@ -105,18 +106,18 @@ def main() -> None:
 		create_kitti_lidar_to_camera()
 	)
 
-	print(
-		"LiDAR-to-body calibration:"
-	)
+	# print(
+	# 	"LiDAR-to-body calibration:"
+	# )
 
-	print(
-		lidar_to_body
-	)
+	# print(
+	# 	lidar_to_body
+	# )
 
-	print(
-		"LiDAR-to-camera calibration loaded:",
-		lidar_to_camera is not None,
-	)
+	# print(
+	# 	"LiDAR-to-camera calibration loaded:",
+	# 	lidar_to_camera is not None,
+	# )
 
 	local_map = LocalMap(
 		maximum_points=200_000
@@ -134,16 +135,15 @@ def main() -> None:
 
 	lidar_frame_index = 0
 
-	print(
-		"Total sensor events:",
-		len(sensor_handler),
-	)
+	# print(
+	# 	"Total sensor events:",
+	# 	len(sensor_handler),
+	# )
 
 	first_latitude, first_longitude = (
 		read_first_oxts_lat_lon(
 			SEQUENCE_PATH
 		)
-
 	)
 
 	osm_plotter = LiveOsmTrajectoryPlotter(
@@ -209,14 +209,14 @@ def main() -> None:
 
 	osm_plotter.initial_rotation_utm_local = rotation_utm_local
 
-	print(
-		"OXTS heading [deg]:",
-		float(
-			np.rad2deg(
-				oxts_heading
-			)
-		),
-	)
+	# print(
+	# 	"OXTS heading [deg]:",
+	# 	float(
+	# 		np.rad2deg(
+	# 			oxts_heading
+	# 		)
+	# 	),
+	# )
 
 	try:
 		for measurement in sensor_handler:
@@ -225,9 +225,10 @@ def main() -> None:
 				measurement,
 				ImuMeasurement,
 			):
-				esikf.propagateImu(
-					measurement
-				)
+				pass
+				# esikf.propagateImu(
+				# 	measurement
+				# )
 
 			# measurement update
 			elif isinstance(
@@ -337,22 +338,24 @@ def main() -> None:
 
 				else:
 
-					update_points_b = points_b[::5]
+					update_points_b = points_b[::7]
 
-					print(
-						f"\nLiDAR {lidar_frame_index}"
-					)
+					# print(
+					# 	f"\nLiDAR {lidar_frame_index}"
+					# )
 
-					print(
-						"  IMU-predicted position:",
-						imu_predicted_position,
-					)
+					# print(
+					# 	"  IMU-predicted position:",
+					# 	imu_predicted_position,
+					# )
 
 					(
 						corrected_quaternion,
 						corrected_position,
+						state
 					) = correct_pose_with_lidar(
 						points_b=update_points_b,
+						state=esikf.state,
 						initial_quaternion_wb=(
 							imu_predicted_quaternion
 						),
@@ -360,7 +363,7 @@ def main() -> None:
 							imu_predicted_position
 						),
 						local_map=local_map,
-						maximum_iterations=5,
+						maximum_iterations=7,
 					)
 
 					lidar_timestamps.append(
@@ -375,29 +378,31 @@ def main() -> None:
 						corrected_quaternion.copy()
 					)
 
-					print(
-						"  LiDAR-corrected position:",
-						corrected_position,
-					)
+					esikf.state = state
+
+					# print(
+					# 	"  LiDAR-corrected position:",
+					# 	corrected_position,
+					# )
 
 					position_correction = (
 						corrected_position
 						- imu_predicted_position
 					)
 
-					print(
-						"  Position correction:",
-						position_correction,
-					)
+					# print(
+					# 	"  Position correction:",
+					# 	position_correction,
+					# )
 
-					print(
-						"  |position correction|:",
-						float(
-							np.linalg.norm(
-								position_correction
-							)
-						),
-					)
+					# print(
+					# 	"  |position correction|:",
+					# 	float(
+					# 		np.linalg.norm(
+					# 			position_correction
+					# 		)
+					# 	),
+					# )
 
 					#update the map visualization
 					lidar_xy_utm = osm_plotter.update(
@@ -435,17 +440,17 @@ def main() -> None:
 						osm_plotter.update_map_matched(
 							match_result.corrected_xy
 						)
-						print(
-							"[MAP MATCH]",
-							"distance:",
-							f"{match_result.distance:.2f}",
-							"lateral:",
-							f"{match_result.lateral_residual:.2f}",
-							"heading error deg:",
-							f"{np.rad2deg(match_result.heading_error):.2f}",
-							"cost:",
-							f"{match_result.cost:.2f}",
-						)
+						# print(
+						# 	"[MAP MATCH]",
+						# 	"distance:",
+						# 	f"{match_result.distance:.2f}",
+						# 	"lateral:",
+						# 	f"{match_result.lateral_residual:.2f}",
+						# 	"heading error deg:",
+						# 	f"{np.rad2deg(match_result.heading_error):.2f}",
+						# 	"cost:",
+						# 	f"{match_result.cost:.2f}",
+						# )
 
 					else:
 						map_matched_positions_xy_utm.append(
@@ -454,9 +459,9 @@ def main() -> None:
 						osm_plotter.update_map_matched(
 							lidar_xy_utm
 						)
-						print(
-							"[MAP MATCH] no road matched"
-						)
+						# print(
+						# 	"[MAP MATCH] no road matched"
+						# )
 
 
 					esikf.state.quaternion_wb = (
@@ -486,7 +491,7 @@ def main() -> None:
 					)
 
 					local_map.add_points(
-						corrected_points_w[::5]
+						corrected_points_w[::7]
 					)
 
 				display_points_w = (
@@ -514,6 +519,8 @@ def main() -> None:
 				cv2.imshow("combinedImage", combinedImage)
 
 				# cv2.waitKey(1)
+
+			# print(f"HERE IS THE STATE COVARIANCE: ==> {esikf.state.covariance}")
 
 
 	finally:
@@ -543,14 +550,14 @@ def main() -> None:
 					dtype=np.float64,
 				),
 			)
-			print(
-				"Saved LiDAR odometry to:",
-				output_path,
-			)
-			print(
-				"Saved LiDAR poses:",
-				len(lidar_positions_w),
-			)
+			# print(
+			# 	"Saved LiDAR odometry to:",
+			# 	output_path,
+			# )
+			# print(
+			# 	"Saved LiDAR poses:",
+			# 	len(lidar_positions_w),
+			# )
 
 			lidar_viewer.close()
 			osm_plotter.close()

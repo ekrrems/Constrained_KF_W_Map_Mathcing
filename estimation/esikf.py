@@ -5,15 +5,44 @@ from geometry.quaternion import (quaternion_to_rotation_matrix,
 								 rotation_vector_to_quaternion,
 								 quaternion_multiply,
 								 normalize_quaternion)
+from geometry.transforms import (transform_body_to_world)
 from config.variables import (POS, STATE_DIM,
 							  ROT, GYRO_BIAS,
 							  VEL, ACCEL_BIAS,
 							  GRAVITY, NOISE_DIM)
+
+from sensors.measurements import LidarMeasurement
+
+from sensors.lidar.lidar_processor import (
+	LidarProcessor,
+)
+from sensors.lidar.lidar_reader import (
+	LidarReader,
+)
+from visualization.lidar_viewer import (
+	LidarViewer,
+)
+from sensors.lidar.lidar_calibration import (
+	create_kitti_lidar_to_camera,
+	create_kitti_lidar_to_imu,
+)
+from estimation.lidar_update import (
+	LidarResidualResult,
+	build_lidar_residuals,
+	skew,
+	build_pose_jacobian,
+	huber_weights,
+	solve_pose_correction,
+	correct_pose_with_lidar
+)
+from mapping.local_map import LocalMap
+
+
 import numpy as np
 
 
 class ESIKF:
-	def __init__(self):
+	def __init__(self, sequencePath: str):
 		self.state = ESIKFState()
 		self.previous_imu: ImuMeasurement | None = None
 		self.state_history: list[ESIKFState] = [
@@ -24,6 +53,50 @@ class ESIKF:
 		self.accel_noise_sigma = 0.10
 		self.gyro_bias_random_walk_sigma = 0.001
 		self.accel_bias_random_walk_sigma = 0.01
+
+		# Lidar variables
+		self.SEQUENCE_PATH = sequencePath
+		self.lidar_timestamps: list[float] = []
+		self.lidar_positions_w: list[np.ndarray] = []
+		self.lidar_quaternions_wb: list[np.ndarray] = []
+
+		self.lidar_reader = LidarReader(
+			self.SEQUENCE_PATH
+		)
+
+		# Lidar data processing
+		self.lidar_processor = LidarProcessor(
+			minimum_range=2.0,
+			maximum_range=80.0,
+			minimum_z=-5.0,
+			maximum_z=5.0,
+			voxel_size=0.25,
+		)
+
+		self.lidar_to_body = (
+			create_kitti_lidar_to_imu()
+		)
+
+		self.lidar_to_camera = (	# not used yet
+			create_kitti_lidar_to_imu()
+		)
+
+		# Open3d visualization for LIDAR
+		self.local_map = LocalMap(maximum_points=200_000)
+
+		# Open3D window
+		self.lidar_viewer = LidarViewer(
+			window_name="LiDAR local map",
+			width=1280,
+			height=800,
+			point_size=2.0,
+			follow_vehicle=True,
+			initial_zoom=0.05,
+		)
+
+		self.lidar_frame_index = 0
+
+
 
 	@staticmethod
 	def skew(vector: np.ndarray) -> np.ndarray:
@@ -251,3 +324,94 @@ class ESIKF:
 			propagated_covariance
 			+ propagated_covariance.T
 		)
+
+	def lidar_measurement_update(self, lidarMeasurement: LidarMeasurement):
+		# process the Lidar batch
+		raw_scan = self.lidar_reader.load_scan(
+			lidarMeasurement
+		)
+
+		processed_scan = (
+			self.lidar_processor.process(
+				raw_scan
+			)
+		)
+
+		points_l = np.asarray(
+			processed_scan.points_l,
+			dtype=np.float64,
+		)
+
+		# Check the batch
+		if len(points_l) == 0:
+			print(f"LiDAR {self.lidar_frame_index}: Empty processed scan")
+			self.lidar_frame_index += 1
+			return 0
+
+		points_b = self.lidar_to_body.transform_points(
+			points_l
+		)
+
+		# Get the world coordinates of the points using the IMU prediction (Nominal state)
+		points_nominal_w = (
+			transform_body_to_world(
+				points_b=points_b,
+				rotation_wb=(
+					self.state.quaternion_wb
+				),
+				position_wb=(
+					self.state.position_wb
+				),
+			)
+		)
+
+		# Check if the local map is empty
+		if self.local_map.is_empty():
+			# The first scan creates the
+			self.local_map.add_points(
+				points_nominal_w[::2] # Make them sparse
+			)
+
+			print(
+				f"LiDAR {self.lidar_frame_index}: "
+				"initialized map with "
+				f"{len(self.local_map)} points"
+			)
+
+			self.lidar_timestamps.append(
+				float(lidarMeasurement.timestamp)
+			)
+
+			self.lidar_positions_w.append(
+				self.state.position_wb
+			)
+			self.lidar_quaternions_wb.append(
+				self.state.quaternion_wb
+			)
+
+		else:
+			update_points_b = points_b[::5]
+			(
+				corrected_quaternion,
+				corrected_position,
+			) = correct_pose_with_lidar(
+				points_b=update_points_b,
+				initial_quaternion_wb=(
+					self.state.quaternion_wb
+				),
+				initial_position_wb=(
+					self.state.position_wb
+				),
+				local_map=self.local_map,
+				maximum_iterations=5,
+			)
+
+			pass
+
+
+
+		# use the pose for the corresponcence of the map
+
+
+
+

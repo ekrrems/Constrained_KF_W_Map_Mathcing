@@ -10,6 +10,8 @@ from mapping.plane_fitting import (
 from geometry.quaternion import quaternion_multiply, quaternion_to_rotation_matrix
 from geometry.transforms import transform_body_to_world
 
+from estimation.state import ESIKFState
+
 
 @dataclass
 class LidarResidualResult:
@@ -435,13 +437,183 @@ def rotation_vector_to_quaternion(
 		)
 	)
 
+def build_state_jacobian(
+		pose_jacobian: np.ndarray,
+		state_dimension: int,
+	) -> np.ndarray:
+	"""
+	Embed the M x 6 pose Jacobian into the full
+	M x N error-state Jacobian.
+
+	Assumed error-state ordering:
+
+		[delta_theta, delta_position, remaining states]
+	"""
+
+	pose_jacobian = np.asarray(
+		pose_jacobian,
+		dtype=np.float64,
+	)
+
+	if pose_jacobian.ndim != 2:
+		raise ValueError(
+			"pose_jacobian must be a matrix."
+		)
+
+	if pose_jacobian.shape[1] != 6:
+		raise ValueError(
+			"pose_jacobian must have six columns."
+		)
+
+	number_of_measurements = (
+		pose_jacobian.shape[0]
+	)
+
+	state_jacobian = np.zeros(
+		(
+			number_of_measurements,
+			state_dimension,
+		),
+		dtype=np.float64,
+	)
+
+	state_jacobian[:, 0:3] = (
+		pose_jacobian[:, 0:3]
+	)
+
+	state_jacobian[:, 3:6] = (
+		pose_jacobian[:, 3:6]
+	)
+
+	return state_jacobian
+
+def update_lidar_covariance(
+		covariance_prior: np.ndarray,
+		state_jacobian: np.ndarray,
+		measurement_variance: float,
+	) -> np.ndarray:
+
+	covariance_prior = np.asarray(
+		covariance_prior,
+		dtype=np.float64,
+	)
+
+	state_jacobian = np.asarray(
+		state_jacobian,
+		dtype=np.float64,
+	)
+
+	state_dimension = (
+		covariance_prior.shape[0]
+	)
+
+	number_of_measurements = (
+		state_jacobian.shape[0]
+	)
+
+	if covariance_prior.shape != (
+		state_dimension,
+		state_dimension,
+	):
+		raise ValueError(
+			"Covariance must be square."
+		)
+
+	if state_jacobian.shape[1] != (
+		state_dimension
+	):
+		raise ValueError(
+			"Jacobian column count must match "
+			"the covariance dimension."
+		)
+
+	measurement_covariance = (
+		measurement_variance
+		* np.eye(
+			number_of_measurements,
+			dtype=np.float64,
+		)
+	)
+
+	projected_covariance = (
+		state_jacobian
+		@ covariance_prior
+		@ state_jacobian.T
+		+ measurement_covariance
+	)
+
+	covariance_times_jacobian_transpose = (
+		covariance_prior
+		@ state_jacobian.T
+	)
+
+	kalman_gain = np.linalg.solve(
+		projected_covariance,
+		covariance_times_jacobian_transpose.T,
+	).T
+
+	identity = np.eye(
+		state_dimension,
+		dtype=np.float64,
+	)
+
+	correction_matrix = (
+		identity
+		- kalman_gain @ state_jacobian
+	)
+
+	covariance_posterior = (
+		correction_matrix
+		@ covariance_prior
+		@ correction_matrix.T
+		+
+		kalman_gain
+		@ measurement_covariance
+		@ kalman_gain.T
+	)
+
+	covariance_posterior = (
+		0.5
+		* (
+			covariance_posterior
+			+ covariance_posterior.T
+		)
+	)
+
+	return covariance_posterior
+
+def inject_error_state(
+	state: ESIKFState,
+	delta_x: np.ndarray,
+	) -> None:
+	delta_quaternion = rotation_vector_to_quaternion(
+		delta_x[0:3]
+	)
+
+	# Right-multiplicative orientation error.
+	state.quaternion_wb = quaternion_multiply(
+		state.quaternion_wb,
+		delta_quaternion,
+	)
+	state.quaternion_wb /= np.linalg.norm(
+		state.quaternion_wb
+	)
+
+	state.position_wb += delta_x[3:6]
+	state.inverse_exposure_time += delta_x[6]
+	state.velocity_wb += delta_x[7:10]
+	state.gyro_bias += delta_x[10:13]
+	state.accel_bias += delta_x[13:16]
+	state.gravity_w += delta_x[16:19]
+
 def correct_pose_with_lidar(
 	points_b: np.ndarray,
+	state: ESIKFState,
 	initial_quaternion_wb: np.ndarray,
 	initial_position_wb: np.ndarray,
 	local_map: LocalMap,
 	maximum_iterations: int = 5,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, ESIKFState]:
 	"""
 	Iterative scan-to-map point-to-plane pose correction.
 	"""
@@ -500,10 +672,14 @@ def correct_pose_with_lidar(
 			rotation_wb=rotation_wb,
 		)
 
+		print(f"Shape of the jacobian ===> {jacobian.shape}")
+
 		delta_pose = solve_pose_correction(
 			jacobian=jacobian,
 			residuals=result.residuals,
 		)
+
+		print(f"The DELTA POSE => {delta_pose}")
 
 		delta_rotation = (
 			delta_pose[0:3]
@@ -552,8 +728,37 @@ def correct_pose_with_lidar(
 			< 1e-3
 		):
 			break
+	H = build_state_jacobian(
+		pose_jacobian=jacobian,
+		state_dimension=state.covariance.shape[0],
+	)
+
+	measurement_variance = 0.05**2
+	R_measurement = (
+		measurement_variance
+		* np.eye(result.number_of_correspondences)
+	)
+
+	P = state.covariance
+
+	S = H @ P @ H.T + R_measurement
+
+	# Numerically preferable to explicitly computing inv(S).
+	K = np.linalg.solve(
+		S,
+		H @ P,
+	).T
+
+	# Correct sign for r(x ⊞ dx) ≈ r(x) + H dx.
+	delta_x = -K @ result.residuals
+
+	inject_error_state(
+		state=state,
+		delta_x=delta_x,
+	)
 
 	return (
 		quaternion_wb,
 		position_wb,
+		state
 	)

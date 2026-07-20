@@ -24,11 +24,11 @@ south, west, north, east = (
 	)
 )
 
-print("OSM area:")
-print("south:", south)
-print("west: ", west)
-print("north:", north)
-print("east: ", east)
+# print("OSM area:")
+# print("south:", south)
+# print("west: ", west)
+# print("north:", north)
+# print("east: ", east)
 
 """
 south: 48.980361091781
