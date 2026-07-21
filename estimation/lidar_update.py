@@ -585,7 +585,7 @@ def update_lidar_covariance(
 def inject_error_state(
 	state: ESIKFState,
 	delta_x: np.ndarray,
-	) -> None:
+	) -> ESIKFState:
 	delta_quaternion = rotation_vector_to_quaternion(
 		delta_x[0:3]
 	)
@@ -605,6 +605,8 @@ def inject_error_state(
 	state.gyro_bias += delta_x[10:13]
 	state.accel_bias += delta_x[13:16]
 	state.gravity_w += delta_x[16:19]
+
+	return state
 
 def correct_pose_with_lidar(
 	points_b: np.ndarray,
@@ -739,7 +741,7 @@ def correct_pose_with_lidar(
 		* np.eye(result.number_of_correspondences)
 	)
 
-	P = state.covariance
+	P = state.covariance.copy()
 
 	S = H @ P @ H.T + R_measurement
 
@@ -752,8 +754,8 @@ def correct_pose_with_lidar(
 	# Correct sign for r(x ⊞ dx) ≈ r(x) + H dx.
 	delta_x = -K @ result.residuals
 
-	inject_error_state(
-		state=state,
+	state = inject_error_state(
+		state=state.copy(),
 		delta_x=delta_x,
 	)
 
