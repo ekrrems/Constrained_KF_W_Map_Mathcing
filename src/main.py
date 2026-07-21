@@ -245,54 +245,6 @@ def main() -> None:
 					vehicle_heading=vehicle_heading_utm,
 				)
 
-				# if match_result.matched:
-				# 	map_matched_positions_xy_utm.append(
-				# 		match_result.corrected_xy.copy()
-				# 	)
-				# 	map_matched_headings.append(
-				# 		match_result.corrected_heading
-				# 	)
-				# 	map_matching_distances.append(
-				# 		match_result.distance
-				# 	)
-				# 	map_matching_costs.append(
-				# 		match_result.cost
-				# 	)
-				# 	osm_plotter.update_map_matched(
-				# 		match_result.corrected_xy
-				# 	)
-				# 	print(
-				# 		"[MAP MATCH]",
-				# 		"distance:",
-				# 		f"{match_result.distance:.2f}",
-				# 		"lateral:",
-				# 		f"{match_result.lateral_residual:.2f}",
-				# 		"heading error deg:",
-				# 		f"{np.rad2deg(match_result.heading_error):.2f}",
-				# 		"cost:",
-				# 		f"{match_result.cost:.2f}",
-				# 	)
-
-				# else:
-				# 	map_matched_positions_xy_utm.append(
-				# 		lidar_xy_utm.copy()
-				# 	)
-				# 	osm_plotter.update_map_matched(
-				# 		lidar_xy_utm
-				# 	)
-					# print(
-					# 	"[MAP MATCH] no road matched"
-					# )
-
-
-				# esikf.state.quaternion_wb = (
-				# 	corrected_quaternion.copy()
-				# )
-
-				# esikf.state.position_wb = (
-				# 	corrected_position.copy()
-				# )
-
 				display_points_w = (
 					esikf.local_map.points_w
 				)
@@ -389,14 +341,6 @@ def main() -> None:
 					dtype=np.float64,
 				),
 			)
-			# print(
-			# 	"Saved LiDAR odometry to:",
-			# 	output_path,
-			# )
-			# print(
-			# 	"Saved LiDAR poses:",
-			# 	len(lidar_positions_w),
-			# )
 
 			lidar_viewer.close()
 			osm_plotter.close()
