@@ -53,7 +53,7 @@ from map_matching.visualization.osm_plotter import (
 )
 
 from map_matching.algorithms.road_segment_matcher import (
-	RoadSegmentMatcher,
+	GreedyRoadSegmentMatcher,
 	estimate_heading_from_last_positions,
 	load_road_segments_from_geojson,
 )
@@ -83,45 +83,8 @@ def main() -> None:
 		SEQUENCE_PATH
 	)
 
-	lidar_reader = LidarReader(
-		SEQUENCE_PATH
-	)
-
 	# initialize state estimator
 	esikf = ESIKF(SEQUENCE_PATH)
-
-	# Lidar data processing
-	lidar_processor = LidarProcessor(
-		minimum_range=2.0,
-		maximum_range=80.0,
-		minimum_z=-5.0,
-		maximum_z=5.0,
-		voxel_size=0.25,
-	)
-
-	lidar_to_body = (
-		create_kitti_lidar_to_imu()
-	)
-	lidar_to_camera = (
-		create_kitti_lidar_to_camera()
-	)
-
-	# print(
-	# 	"LiDAR-to-body calibration:"
-	# )
-
-	# print(
-	# 	lidar_to_body
-	# )
-
-	# print(
-	# 	"LiDAR-to-camera calibration loaded:",
-	# 	lidar_to_camera is not None,
-	# )
-
-	# local_map = LocalMap(
-	# 	maximum_points=200_000
-	# )
 
 	# visualization
 	lidar_viewer = LidarViewer(
@@ -132,13 +95,6 @@ def main() -> None:
 		follow_vehicle=True,
 		initial_zoom=0.05,
 	)
-
-	lidar_frame_index = 0
-
-	# print(
-	# 	"Total sensor events:",
-	# 	len(sensor_handler),
-	# )
 
 	first_latitude, first_longitude = (
 		read_first_oxts_lat_lon(
@@ -158,7 +114,7 @@ def main() -> None:
 		target_crs="EPSG:32632",
 	)
 
-	road_matcher = RoadSegmentMatcher(
+	road_matcher = GreedyRoadSegmentMatcher(
 		segments=road_segments,
 		search_radius=35.0,
 		sigma_distance=5.0,
@@ -207,6 +163,8 @@ def main() -> None:
 		oxts_heading
 	)
 
+	match_result = False
+
 	osm_plotter.initial_rotation_utm_local = rotation_utm_local
 
 	# print(
@@ -235,143 +193,26 @@ def main() -> None:
 				measurement,
 				LidarMeasurement,
 			):
-				# raw_scan = lidar_reader.load_scan(
-				# 	measurement
-				# )
-
-				# processed_scan = (
-				# 	lidar_processor.process(
-				# 		raw_scan
-				# 	)
-				# )
-
-				# points_l = np.asarray(
-				# 	processed_scan.points_l,
-				# 	dtype=np.float64,
-				# )
-
-				# if len(points_l) == 0:
-				# 	print(
-				# 		f"LiDAR {lidar_frame_index}: "
-				# 		"empty processed scan"
-				# 	)
-
-				# 	lidar_frame_index += 1
-				# 	continue
-
-
-				# points_b = (
-				# 	lidar_to_body.transform_points(
-				# 		points_l
-				# 	)
-				# )
-
-				# # 4. Preserve the state produced only by IMU
-				# imu_predicted_quaternion = (
-				# 	esikf.state.quaternion_wb.copy()
-				# )
-
-				imu_predicted_position = (
-					esikf.state.position_wb.copy()
+				lidar_result = (
+					esikf.lidar_measurement_update(
+						measurement
+					)
 				)
 
-				# imu_predicted_rotation = (
-				# 	quaternion_to_rotation_matrix(
-				# 		imu_predicted_quaternion
-				# 	)
-				# )
+				if lidar_result is None:
+					continue
 
-				# # Transform scan using the IMU-predicted
-				# imu_predicted_points_w = (
-				# 	transform_body_to_world(
-				# 		points_b=points_b,
-				# 		rotation_wb=(
-				# 			imu_predicted_rotation
-				# 		),
-				# 		position_wb=(
-				# 			imu_predicted_position
-				# 		),
-				# 	)
-				# )
+				predicted_position = (
+					lidar_result.predicted_position_wb
+				)
 
-				# if local_map.is_empty():
-				# 	# There is no existing map with which the
-				# 	# first scan can be compared.
-				# 	#
-				# 	# The first scan defines the initial map.
-				# 	local_map.add_points(
-				# 		imu_predicted_points_w[::2]
-				# 	)
+				corrected_position = (
+					lidar_result.corrected_position_wb
+				)
 
-				# 	print(
-				# 		f"LiDAR {lidar_frame_index}: "
-				# 		"initialized map with "
-				# 		f"{len(local_map)} points"
-				# 	)
-
-				# 	corrected_quaternion = (
-				# 		imu_predicted_quaternion.copy()
-				# 	)
-
-				# 	corrected_position = (
-				# 		imu_predicted_position.copy()
-				# 	)
-
-				# 	corrected_points_w = (
-				# 		imu_predicted_points_w
-				# 	)
-
-				# 	lidar_timestamps.append(
-				# 		float(measurement.timestamp)
-				# 	)
-
-				# 	lidar_positions_w.append(
-				# 		corrected_position.copy()
-				# 	)
-
-				# 	lidar_quaternions_wb.append(
-				# 		corrected_quaternion.copy()
-				# 	)
-
-				# 	# Showcased the local map
-
-
-				# else:
-
-				# 	update_points_b = points_b[::7]
-
-				# 	# print(
-				# 	# 	f"\nLiDAR {lidar_frame_index}"
-				# 	# )
-
-				# 	# print(
-				# 	# 	"  IMU-predicted position:",
-				# 	# 	imu_predicted_position,
-				# 	# )
-
-				# 	(
-				# 		corrected_quaternion,
-				# 		corrected_position,
-				# 		state
-				# 	) = correct_pose_with_lidar(
-				# 		points_b=update_points_b,
-				# 		state=esikf.state,
-				# 		initial_quaternion_wb=(
-				# 			imu_predicted_quaternion
-				# 		),
-				# 		initial_position_wb=(
-				# 			imu_predicted_position
-				# 		),
-				# 		local_map=local_map,
-				# 		maximum_iterations=7,
-				# 	)
-				(points_b, corrected_position, corrected_quaternion) = esikf.lidar_measurement_update(measurement)
-
-				# if corrected_position is None or corrected_quaternion is None:
-				# 	continue
-
-				print("We GET THE POINTS")
-				print(corrected_position.shape)
+				corrected_quaternion = (
+					lidar_result.corrected_quaternion_wb
+				)
 
 				lidar_timestamps.append(
 					float(measurement.timestamp)
@@ -385,22 +226,6 @@ def main() -> None:
 					corrected_quaternion.copy()
 				)
 
-
-					# print(
-					# 	"  Position correction:",
-					# 	position_correction,
-					# )
-
-					# print(
-					# 	"  |position correction|:",
-					# 	float(
-					# 		np.linalg.norm(
-					# 			position_correction
-					# 		)
-					# 	),
-					# )
-
-					#update the map visualization
 				lidar_xy_utm = osm_plotter.update(
 					corrected_position
 				)
@@ -420,77 +245,53 @@ def main() -> None:
 					vehicle_heading=vehicle_heading_utm,
 				)
 
-				if match_result.matched:
-					map_matched_positions_xy_utm.append(
-						match_result.corrected_xy.copy()
-					)
-					map_matched_headings.append(
-						match_result.corrected_heading
-					)
-					map_matching_distances.append(
-						match_result.distance
-					)
-					map_matching_costs.append(
-						match_result.cost
-					)
-					osm_plotter.update_map_matched(
-						match_result.corrected_xy
-					)
-					print(
-						"[MAP MATCH]",
-						"distance:",
-						f"{match_result.distance:.2f}",
-						"lateral:",
-						f"{match_result.lateral_residual:.2f}",
-						"heading error deg:",
-						f"{np.rad2deg(match_result.heading_error):.2f}",
-						"cost:",
-						f"{match_result.cost:.2f}",
-					)
+				# if match_result.matched:
+				# 	map_matched_positions_xy_utm.append(
+				# 		match_result.corrected_xy.copy()
+				# 	)
+				# 	map_matched_headings.append(
+				# 		match_result.corrected_heading
+				# 	)
+				# 	map_matching_distances.append(
+				# 		match_result.distance
+				# 	)
+				# 	map_matching_costs.append(
+				# 		match_result.cost
+				# 	)
+				# 	osm_plotter.update_map_matched(
+				# 		match_result.corrected_xy
+				# 	)
+				# 	print(
+				# 		"[MAP MATCH]",
+				# 		"distance:",
+				# 		f"{match_result.distance:.2f}",
+				# 		"lateral:",
+				# 		f"{match_result.lateral_residual:.2f}",
+				# 		"heading error deg:",
+				# 		f"{np.rad2deg(match_result.heading_error):.2f}",
+				# 		"cost:",
+				# 		f"{match_result.cost:.2f}",
+				# 	)
 
-				else:
-					map_matched_positions_xy_utm.append(
-						lidar_xy_utm.copy()
-					)
-					osm_plotter.update_map_matched(
-						lidar_xy_utm
-					)
+				# else:
+				# 	map_matched_positions_xy_utm.append(
+				# 		lidar_xy_utm.copy()
+				# 	)
+				# 	osm_plotter.update_map_matched(
+				# 		lidar_xy_utm
+				# 	)
 					# print(
 					# 	"[MAP MATCH] no road matched"
 					# )
 
 
-				esikf.state.quaternion_wb = (
-					corrected_quaternion.copy()
-				)
+				# esikf.state.quaternion_wb = (
+				# 	corrected_quaternion.copy()
+				# )
 
-				esikf.state.position_wb = (
-					corrected_position.copy()
-				)
-
-				corrected_rotation_wb = (
-					quaternion_to_rotation_matrix(
-						corrected_quaternion
-					)
-				)
-
-				corrected_points_w = (
-					transform_body_to_world(
-						points_b=points_b,
-						rotation_wb=(
-							corrected_rotation_wb
-						),
-						position_wb=(
-							corrected_position
-						),
-					)
-				)
-
-				print(f"SHAPE OF THE CORRECTED POINTS WORLD =====> {corrected_points_w.shape}")
-
-				esikf.local_map.add_points(
-					corrected_points_w[::7]
-				)
+				# esikf.state.position_wb = (
+				# 	corrected_position.copy()
+				# )
 
 				display_points_w = (
 					esikf.local_map.points_w
@@ -498,7 +299,7 @@ def main() -> None:
 
 				viewer_running = lidar_viewer.update(
 					points_w=display_points_w,
-					imu_position_w=imu_predicted_position,
+					imu_position_w=predicted_position,
 					corrected_position_w=corrected_position,
 					corrected_quaternion_wb=corrected_quaternion,
 				)
@@ -506,7 +307,6 @@ def main() -> None:
 				if not viewer_running:
 					break
 
-				lidar_frame_index += 1
 
 			elif isinstance(
 				measurement,
@@ -518,7 +318,48 @@ def main() -> None:
 
 				# cv2.waitKey(1)
 
-			# print(f"HERE IS THE STATE COVARIANCE: ==> {esikf.state.covariance}")
+			"""
+			Map Matching algorithms is applied here
+			"""
+
+			# Simple two step map matching
+
+			if match_result.matched:
+				map_matched_positions_xy_utm.append(
+					match_result.corrected_xy.copy()
+				)
+				map_matched_headings.append(
+					match_result.corrected_heading
+				)
+				map_matching_distances.append(
+					match_result.distance
+				)
+				map_matching_costs.append(
+					match_result.cost
+				)
+				osm_plotter.update_map_matched(
+					match_result.corrected_xy
+				)
+				print(
+					"[MAP MATCH]",
+					"distance:",
+					f"{match_result.distance:.2f}",
+					"lateral:",
+					f"{match_result.lateral_residual:.2f}",
+					"heading error deg:",
+					f"{np.rad2deg(match_result.heading_error):.2f}",
+					"cost:",
+					f"{match_result.cost:.2f}",
+				)
+
+			else:
+				map_matched_positions_xy_utm.append(
+					lidar_xy_utm.copy()
+				)
+				osm_plotter.update_map_matched(
+					lidar_xy_utm
+				)
+
 
 
 	finally:

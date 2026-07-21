@@ -36,9 +36,17 @@ from estimation.lidar_update import (
 	correct_pose_with_lidar
 )
 from mapping.local_map import LocalMap
-
-
 import numpy as np
+
+@dataclass
+class LidarUpdateResult:
+    points_b: np.ndarray
+    predicted_position_wb: np.ndarray
+    predicted_quaternion_wb: np.ndarray
+    corrected_position_wb: np.ndarray
+    corrected_quaternion_wb: np.ndarray
+    corrected_points_w: np.ndarray
+    initialized_map: bool
 
 
 class ESIKF:
@@ -56,15 +64,10 @@ class ESIKF:
 
 		# Lidar variables
 		self.SEQUENCE_PATH = sequencePath
-		self.lidar_timestamps: list[float] = []
-		self.lidar_positions_w: list[np.ndarray] = []
-		self.lidar_quaternions_wb: list[np.ndarray] = []
-
 		self.lidar_reader = LidarReader(
 			self.SEQUENCE_PATH
 		)
 
-		# Lidar data processing
 		self.lidar_processor = LidarProcessor(
 			minimum_range=2.0,
 			maximum_range=80.0,
@@ -77,26 +80,19 @@ class ESIKF:
 			create_kitti_lidar_to_imu()
 		)
 
-		self.lidar_to_camera = (	# not used yet
-			create_kitti_lidar_to_imu()
+		self.lidar_to_camera = (
+			create_kitti_lidar_to_camera()
 		)
 
-
-		# Open3d visualization for LIDAR
-		self.local_map = LocalMap(maximum_points=200_000)
-
-		# Open3D window
-		self.lidar_viewer = LidarViewer(
-			window_name="LiDAR local map",
-			width=1280,
-			height=800,
-			point_size=2.0,
-			follow_vehicle=True,
-			initial_zoom=0.05,
+		self.local_map = LocalMap(
+			maximum_points=200_000
 		)
 
 		self.lidar_frame_index = 0
 
+		self.lidar_timestamps: list[float] = []
+		self.lidar_positions_w: list[np.ndarray] = []
+		self.lidar_quaternions_wb: list[np.ndarray] = []
 
 
 	@staticmethod
@@ -329,11 +325,8 @@ class ESIKF:
 	def lidar_measurement_update(
 		self,
 		lidar_measurement: LidarMeasurement,
-	) -> tuple[
-		np.ndarray,
-		np.ndarray,
-		np.ndarray,
-	]:
+	) -> LidarUpdateResult | None:
+
 		raw_scan = self.lidar_reader.load_scan(
 			lidar_measurement
 		)
@@ -349,11 +342,6 @@ class ESIKF:
 			dtype=np.float64,
 		)
 
-		print(
-			"LiDAR points shape:",
-			points_l.shape,
-		)
-
 		if len(points_l) == 0:
 			print(
 				f"LiDAR {self.lidar_frame_index}: "
@@ -361,23 +349,17 @@ class ESIKF:
 			)
 
 			self.lidar_frame_index += 1
+			return None
 
-			return (
-				np.empty(
-					(0, 3),
-					dtype=np.float64,
-				),
-				self.state.position_wb.copy(),
-				self.state.quaternion_wb.copy(),
-			)
-
-		# LiDAR coordinates → body coordinates.
+		# LiDAR frame → body/IMU frame.
 		points_b = (
 			self.lidar_to_body.transform_points(
 				points_l
 			)
 		)
 
+		# Preserve the prediction that existed immediately
+		# before the LiDAR update.
 		predicted_quaternion_wb = (
 			self.state.quaternion_wb.copy()
 		)
@@ -386,15 +368,14 @@ class ESIKF:
 			self.state.position_wb.copy()
 		)
 
+		# transform_body_to_world expects a 3x3 matrix.
 		predicted_rotation_wb = (
 			quaternion_to_rotation_matrix(
 				predicted_quaternion_wb
 			)
 		)
 
-		# Body coordinates → local world coordinates
-		# using the predicted pose.
-		points_predicted_w = (
+		predicted_points_w = (
 			transform_body_to_world(
 				points_b=points_b,
 				rotation_wb=(
@@ -406,29 +387,27 @@ class ESIKF:
 			)
 		)
 
-		print(
-			"Predicted world points shape:",
-			points_predicted_w.shape,
-		)
+		initialized_map = False
 
 		if self.local_map.is_empty():
-			# No scan matching is possible yet.
-			# The first scan initializes the map.
-			corrected_position = (
-				predicted_position_wb.copy()
-			)
-
-			corrected_quaternion = (
+			# The first scan defines the initial local map.
+			corrected_quaternion_wb = (
 				predicted_quaternion_wb.copy()
 			)
 
+			corrected_position_wb = (
+				predicted_position_wb.copy()
+			)
+
 			corrected_points_w = (
-				points_predicted_w
+				predicted_points_w
 			)
 
 			self.local_map.add_points(
 				corrected_points_w[::2]
 			)
+
+			initialized_map = True
 
 			print(
 				f"LiDAR {self.lidar_frame_index}: "
@@ -437,18 +416,14 @@ class ESIKF:
 			)
 
 		else:
-			# Use fewer points for optimization.
-			update_points_b = points_b[::5]
-
-			print(
-				"Update points shape:",
-				update_points_b.shape,
-			)
+			# Use exactly the same sampling ratio as the
+			# working main implementation.
+			update_points_b = points_b[::7]
 
 			(
-				corrected_quaternion,
-				corrected_position,
-				self.state,
+				corrected_quaternion_wb,
+				corrected_position_wb,
+				corrected_state,
 			) = correct_pose_with_lidar(
 				points_b=update_points_b,
 				state=self.state,
@@ -459,38 +434,30 @@ class ESIKF:
 					predicted_position_wb
 				),
 				local_map=self.local_map,
-				maximum_iterations=5,
+				maximum_iterations=7,
 			)
 
-			print(
-				"Corrected position shape:",
-				corrected_position.shape,
+			# Install the state returned by the correction.
+			self.state = corrected_state
+
+			# Make the nominal pose explicitly consistent
+			# with the returned corrected pose.
+			self.state.quaternion_wb = (
+				corrected_quaternion_wb.copy()
 			)
 
-			print(
-				"Corrected quaternion shape:",
-				corrected_quaternion.shape,
+			self.state.position_wb = (
+				corrected_position_wb.copy()
 			)
 
-			position_correction = (
-				corrected_position
-				- predicted_position_wb
-			)
-
-			print(
-				"Position correction:",
-				position_correction,
-			)
-
-			# Convert corrected quaternion to a matrix.
 			corrected_rotation_wb = (
 				quaternion_to_rotation_matrix(
-					corrected_quaternion
+					corrected_quaternion_wb
 				)
 			)
 
-			# Transform the complete scan using the
-			# corrected pose.
+			# Use the complete processed scan for mapping,
+			# not only the sparse optimization points.
 			corrected_points_w = (
 				transform_body_to_world(
 					points_b=points_b,
@@ -498,26 +465,62 @@ class ESIKF:
 						corrected_rotation_wb
 					),
 					position_wb=(
-						corrected_position
+						corrected_position_wb
 					),
 				)
 			)
 
-			# Add only the correctly transformed scan.
 			self.local_map.add_points(
-				corrected_points_w[::5]
+				corrected_points_w[::3]
 			)
+
+			position_correction = (
+				corrected_position_wb
+				- predicted_position_wb
+			)
+
+			print(
+				"LiDAR position correction:",
+				position_correction,
+			)
+
+		# Store independent snapshots.
+		self.lidar_timestamps.append(
+			float(lidar_measurement.timestamp)
+		)
+
+		self.lidar_positions_w.append(
+			corrected_position_wb.copy()
+		)
+
+		self.lidar_quaternions_wb.append(
+			corrected_quaternion_wb.copy()
+		)
+
+
+		result = LidarUpdateResult(
+			points_b=points_b,
+			predicted_position_wb=(
+				predicted_position_wb
+			),
+			predicted_quaternion_wb=(
+				predicted_quaternion_wb
+			),
+			corrected_position_wb=(
+				corrected_position_wb
+			),
+			corrected_quaternion_wb=(
+				corrected_quaternion_wb
+			),
+			corrected_points_w=(
+				corrected_points_w
+			),
+			initialized_map=initialized_map,
+		)
 
 		self.lidar_frame_index += 1
 
-		return (
-			points_b,
-			corrected_position.copy(),
-			corrected_quaternion.copy(),
-		)
-
-		# use the pose for the corresponcence of the map
-
+		return result
 
 
 

@@ -315,14 +315,14 @@ def load_road_segments_from_geojson(
 	return segments, roads_metric
 
 
-class RoadSegmentMatcher:
+class GreedyRoadSegmentMatcher:
 	def __init__(
 		self,
 		segments: list[RoadSegment],
 		search_radius: float = 30.0,
 		sigma_distance: float = 5.0,
 		sigma_heading: float = np.deg2rad(25.0),
-		position_correction_alpha: float = 0.6,
+		position_correction_alpha: float = 1.0,
 		heading_correction_beta: float = 0.4,
 	) -> None:
 		self.segments = segments
