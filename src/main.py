@@ -58,6 +58,15 @@ from map_matching.algorithms.road_segment_matcher import (
 	load_road_segments_from_geojson,
 )
 
+# Map Matching Algorithms
+from map_matching.algorithms.general_mm_algo import (
+	GeneralMapMatcher,
+	GeneralMMResult,
+	RoadLink,
+	RoadNode,
+	MapMatchingObservation,
+)
+
 
 SEQUENCE_PATH = Path(
 	"/Users/ekremserdarozturk/Desktop/"
@@ -107,6 +116,10 @@ def main() -> None:
 		start_latitude=first_latitude,
 		start_longitude=first_longitude,
 	)
+
+	# Load Road Nodes and Links
+	road_nodes, road_links = osm_plotter.road_nodes, osm_plotter.road_links
+	general_map_mathcer = GeneralMapMatcher(road_nodes=road_nodes, road_links=road_links)
 
 	# Introduce the map mathcing algos here
 	road_segments, roads_metric = load_road_segments_from_geojson(
@@ -163,18 +176,20 @@ def main() -> None:
 		oxts_heading
 	)
 
+	print("#################### HEADINNNNNNG ######", rotation_utm_local)
+
 	match_result = False
 
 	osm_plotter.initial_rotation_utm_local = rotation_utm_local
 
-	# print(
-	# 	"OXTS heading [deg]:",
-	# 	float(
-	# 		np.rad2deg(
-	# 			oxts_heading
-	# 		)
-	# 	),
-	# )
+	print(
+		"OXTS heading [deg]:",
+		float(
+			np.rad2deg(
+				oxts_heading
+			)
+		),
+	)
 
 	try:
 		for measurement in sensor_handler:
@@ -256,6 +271,20 @@ def main() -> None:
 					corrected_quaternion_wb=corrected_quaternion,
 				)
 
+				# Add the map mathcing algos here
+
+				(
+					closest_node,
+					heading_results
+	 			) = general_map_mathcer.run(esikf.state.copy(), lidar_xy_utm, rotation_utm_local)
+				# osm_plotter.update_heading_candidates(
+				# 	closest_node=closest_node,
+				# 	heading_results=heading_results,
+				# 	road_links=(
+				# 		general_map_mathcer.road_links
+				# 	),
+				# )
+
 				if not viewer_running:
 					break
 
@@ -271,6 +300,7 @@ def main() -> None:
 				# cv2.waitKey(1)
 
 			"""
+			MAP MATHCING SECTION
 			Map Matching algorithms is applied here
 			"""
 
@@ -311,6 +341,13 @@ def main() -> None:
 				osm_plotter.update_map_matched(
 					lidar_xy_utm
 				)
+
+			# General Map mathcing Algo for Transport Telematics
+			# if lidar_xy_utm is None or vehicle_heading_utm is None:
+			# 	continue
+			# else:
+			# 	general_map_mathcer.run(esikf.state.copy(), lidar_xy_utm, vehicle_heading_utm)
+
 
 
 

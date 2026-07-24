@@ -674,14 +674,12 @@ def correct_pose_with_lidar(
 			rotation_wb=rotation_wb,
 		)
 
-		print(f"Shape of the jacobian ===> {jacobian.shape}")
 
 		delta_pose = solve_pose_correction(
 			jacobian=jacobian,
 			residuals=result.residuals,
 		)
 
-		print(f"The DELTA POSE => {delta_pose}")
 
 		delta_rotation = (
 			delta_pose[0:3]
@@ -708,15 +706,15 @@ def correct_pose_with_lidar(
 
 		position_wb += delta_position
 
-		print(
-			f"  iteration {iteration}: "
-			f"correspondences="
-			f"{result.number_of_correspondences}, "
-			f"|dtheta|="
-			f"{np.linalg.norm(delta_rotation):.6f}, "
-			f"|dp|="
-			f"{np.linalg.norm(delta_position):.6f}"
-		)
+		# print(
+		# 	f"  iteration {iteration}: "
+		# 	f"correspondences="
+		# 	f"{result.number_of_correspondences}, "
+		# 	f"|dtheta|="
+		# 	f"{np.linalg.norm(delta_rotation):.6f}, "
+		# 	f"|dp|="
+		# 	f"{np.linalg.norm(delta_position):.6f}"
+		# )
 
 		if (
 			np.linalg.norm(

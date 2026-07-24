@@ -479,10 +479,10 @@ class ESIKF:
 				- predicted_position_wb
 			)
 
-			print(
-				"LiDAR position correction:",
-				position_correction,
-			)
+			# print(
+			# 	"LiDAR position correction:",
+			# 	position_correction,
+			# )
 
 		# Store independent snapshots.
 		self.lidar_timestamps.append(
