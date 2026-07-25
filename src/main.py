@@ -41,15 +41,12 @@ from visualization.lidar_viewer import (
 )
 from visualization.covariance_viewer import plot_trajectory_with_covariance
 
-from map_matching.visualization.live_osm_plotter import (
-	LiveOsmTrajectoryPlotter,
-)
-
 from map_matching.visualization.osm_plotter import (
 	read_first_oxts_lat_lon,
 	read_oxts_lat_lon_sequence,
 	estimate_heading_from_points,
-	rotation_matrix_2d
+	rotation_matrix_2d,
+	read_oxts_yaw_rad,
 )
 
 from map_matching.algorithms.road_segment_matcher import (
@@ -66,6 +63,13 @@ from map_matching.algorithms.general_mm_algo import (
 	RoadNode,
 	MapMatchingObservation,
 )
+from map_matching.data.generate_road_network import build_road_network
+
+from map_matching.visualization.live_map_window import (
+	LiveMapWindow
+)
+
+from map_matching.visualization.pose_layer import PoseLayer
 
 
 SEQUENCE_PATH = Path(
@@ -92,9 +96,6 @@ def main() -> None:
 		SEQUENCE_PATH
 	)
 
-	# initialize state estimator
-	esikf = ESIKF(SEQUENCE_PATH)
-
 	# visualization
 	lidar_viewer = LidarViewer(
 		window_name="LiDAR local map",
@@ -111,23 +112,24 @@ def main() -> None:
 		)
 	)
 
-	osm_plotter = LiveOsmTrajectoryPlotter(
-		geojson_path=OSM_PATH,
-		start_latitude=first_latitude,
-		start_longitude=first_longitude,
-	)
-
-	# Load Road Nodes and Links
-	road_nodes, road_links = osm_plotter.road_nodes, osm_plotter.road_links
-	general_map_mathcer = GeneralMapMatcher(road_nodes=road_nodes, road_links=road_links)
-
-	# Introduce the map mathcing algos here
 	road_segments, roads_metric = load_road_segments_from_geojson(
 		geojson_path=OSM_PATH,
 		target_crs="EPSG:32632",
 	)
 
-	road_matcher = GreedyRoadSegmentMatcher(
+	# Get road nodes and links from Geojson
+	(
+		road_nodes,
+		road_links,
+	) = build_road_network(
+		roads_metric=roads_metric,
+		node_tolerance_m=0.5,
+	)
+
+	# Introduce the map mathcing algos here
+	general_map_mathcer = GeneralMapMatcher(road_nodes=road_nodes, road_links=road_links)
+
+	greedy_road_matcher = GreedyRoadSegmentMatcher(
 		segments=road_segments,
 		search_radius=35.0,
 		sigma_distance=5.0,
@@ -142,45 +144,48 @@ def main() -> None:
 	map_matching_distances: list[float] = []
 	map_matching_costs: list[float] = []
 
-	# Get real world orientation using OXTS lat and long
-	oxts_latitudes, oxts_longitudes = (
-		read_oxts_lat_lon_sequence(
-			SEQUENCE_PATH,
-			maximum_count=30,
-		)
-	)
-
-	oxts_xy_utm = np.asarray(
-		[
-			osm_plotter._geodetic_to_metric_xy(
-				latitude=latitude,
-				longitude=longitude,
-			)
-			for latitude, longitude in zip(
-				oxts_latitudes,
-				oxts_longitudes,
-			)
-		],
-		dtype=np.float64,
-	)
-
 	oxts_heading = estimate_heading_from_points(
-		oxts_xy_utm,
+		SEQUENCE_PATH,
+		OSM_PATH,
 		start_index=0,
 		end_index=20,
 	)
 
-	osm_plotter.oxts_heading = oxts_heading
+	# initialize state estimator
+	esikf = ESIKF(SEQUENCE_PATH,np.array([first_latitude, first_longitude]), oxts_heading)
 
-	rotation_utm_local = rotation_matrix_2d(
-		oxts_heading
+	# Test the new visualization section #
+	map_window = LiveMapWindow(
+		roads_metric=roads_metric
 	)
 
-	print("#################### HEADINNNNNNG ######", rotation_utm_local)
+	lidar_pose = (
+		map_window.create_pose_layer(
+			name="LiDAR pose",
+			color="red",
+			# heading_length_m=8.0,
+		)
+	)
 
-	match_result = False
+	lidar_poses = []
 
-	osm_plotter.initial_rotation_utm_local = rotation_utm_local
+	# greedy_mm_pose = (
+	# 	map_window.create_pose_layer(
+	# 		name="Map-matched pose",
+	# 		color="blue",
+	# 		# heading_length_m=8.0,
+	# 	)
+	# )
+
+	general_mm_pose = (
+		map_window.create_pose_layer(
+			name="General Map Matching pose",
+			color="orange",
+			heading_length=3.0,
+		)
+	)
+
+	map_window.finish_initialization()
 
 	print(
 		"OXTS heading [deg]:",
@@ -241,28 +246,25 @@ def main() -> None:
 					corrected_quaternion.copy()
 				)
 
-				lidar_xy_utm = osm_plotter.update(
-					corrected_position
+				match_result = greedy_road_matcher.match_and_correct(
+					vehicle_xy=corrected_position[:2].copy(),
+					vehicle_heading=(esikf.quaternion_to_yaw_rad(corrected_quaternion))
 				)
 
-
-				lidar_positions_xy_utm.append(
-					lidar_xy_utm.copy()
-				)
-
-				vehicle_heading_utm = estimate_heading_from_last_positions(
-					lidar_positions_xy_utm,
-					minimum_displacement=0.5,
-				)
-
-				match_result = road_matcher.match_and_correct(
-					vehicle_xy=lidar_xy_utm,
-					vehicle_heading=vehicle_heading_utm,
-				)
+				# greedy_mm_pose.update(
+				# 	match_result.corrected_xy,
+				# 	match_result.corrected_heading
+				# )
 
 				display_points_w = (
 					esikf.local_map.points_w
 				)
+
+				# Test visualization
+				# lidar_pose.update(
+				# 	position_xy_utm=corrected_position[:2].copy(),
+				# 	heading_rad=(esikf.quaternion_to_yaw_rad(corrected_quaternion)),
+				# )
 
 				viewer_running = lidar_viewer.update(
 					points_w=display_points_w,
@@ -272,18 +274,207 @@ def main() -> None:
 				)
 
 				# Add the map mathcing algos here
-
 				(
 					closest_node,
 					heading_results
-	 			) = general_map_mathcer.run(esikf.state.copy(), lidar_xy_utm, rotation_utm_local)
-				# osm_plotter.update_heading_candidates(
-				# 	closest_node=closest_node,
-				# 	heading_results=heading_results,
-				# 	road_links=(
-				# 		general_map_mathcer.road_links
-				# 	),
+	 			) = general_map_mathcer.run(esikf.state.copy(),
+								corrected_position[:2].copy(),
+								esikf.quaternion_to_yaw_rad(corrected_quaternion)
+					)
+				selected_link = (
+					general_map_mathcer.road_links[
+						heading_results[0][
+							"link_id"
+						]
+					]
+				)
+
+				# Show the general maap mathcing part
+				projection = heading_results[0]["projection"]
+				segment_index = (
+					projection.segment_index
+				)
+
+				segment_start = (
+					selected_link.geometry_xy[
+						segment_index
+					]
+				)
+
+				segment_end = (
+					selected_link.geometry_xy[
+						segment_index + 1
+					]
+				)
+
+				segment_vector = (
+					segment_end
+					- segment_start
+				)
+
+				matched_heading_rad = float(
+					np.arctan2(
+						segment_vector[1],
+						segment_vector[0],
+					)
+				)
+
+				# road_tangent_xy = np.array(
+				# 	[
+				# 		np.cos(matched_heading_rad),
+				# 		np.sin(matched_heading_rad),
+				# 	],
+				# 	dtype=np.float64,
 				# )
+
+				# Update the measurement using the map mathcing algo
+				"@@@@@@@@@@@@"
+				# road_normal_xy = np.array(
+				# 	[
+				# 		-road_tangent_xy[1],
+				# 		road_tangent_xy[0],
+				# 	],
+				# 	dtype=np.float64,
+				# )
+
+				# position_before = (
+				# 	esikf.state.position_wb[:2].copy()
+				# )
+
+				# residual_before = float(
+				# 	road_normal_xy
+				# 	@ (
+				# 		projection.closest_point_xy
+				# 		- position_before
+				# 	)
+				# )
+
+				# position_covariance_xy = (
+				# 	esikf.state.covariance[3:5, 3:5]
+				# )
+
+				# lateral_variance = float(
+				# 	road_normal_xy
+				# 	@ position_covariance_xy
+				# 	@ road_normal_xy
+				# )
+
+				# measurement_variance = 0.1**2
+
+				# expected_gain = (
+				# 	lateral_variance
+				# 	/ (
+				# 		lateral_variance
+				# 		+ measurement_variance
+				# 	)
+				# )
+
+				# print("Position covariance:\n", position_covariance_xy)
+				# print("Lateral variance:", lateral_variance)
+				# print("Map variance:", measurement_variance)
+				# print("Expected lateral gain:", expected_gain)
+				# print("Residual before:", residual_before)
+
+				# esikf.road_map_measurement_update(
+				# 	matched_position_xy=(
+				# 		projection.closest_point_xy
+				# 	),
+				# 	road_tangent_xy=road_tangent_xy,
+				# 	measurement_std_m=0.01,
+				# )
+
+				# position_after = (
+				# 	esikf.state.position_wb[:2].copy()
+				# )
+
+				# residual_after = float(
+				# 	road_normal_xy
+				# 	@ (
+				# 		projection.closest_point_xy
+				# 		- position_after
+				# 	)
+				# )
+
+				# print("Position before:", position_before)
+				# print("Position after:", position_after)
+				# print("Projection:", projection.closest_point_xy)
+				# print("Residual after:", residual_after)
+				# "@@@@@@@@@@@@@@"
+				# esikf.road_map_measurement_update(
+				# 	matched_position_xy=(
+				# 		projection.closest_point_xy
+				# 	),
+				# 	road_tangent_xy=(
+				# 		road_tangent_xy
+				# 	),
+				# 	measurement_std_m=0.1,
+				# )
+
+				general_mm_pose.update(
+					position_xy_utm=(
+						projection
+						.closest_point_xy
+					),
+					heading_rad=(
+						matched_heading_rad
+					),
+				)
+
+				candidate_positions_xy = np.asarray(
+					[
+						result["projection"].closest_point_xy
+						for result in heading_results
+					],
+					dtype=np.float64,
+				)
+
+				lidar_pose.update(
+					position_xy_utm=esikf.state.position_wb[:2].copy(),
+					heading_rad=(esikf.quaternion_to_yaw_rad(esikf.state.quaternion_wb.copy())),
+				)
+
+				map_window.update_selected_link(
+					selected_link
+				)
+
+				map_window.update_debug_points(
+					lidar_position_xy=(
+						corrected_position[:2]
+					),
+					matched_position_xy=(
+						projection.closest_point_xy
+					),
+					candidate_positions_xy=(
+						candidate_positions_xy
+					),
+					follow_radius_m=40.0,
+				)
+
+				print(
+					"Vehicle position:",
+					corrected_position,
+				)
+
+				print(
+					"Map minimum:",
+					np.min(
+						display_points_w,
+						axis=0,
+					),
+				)
+
+				print(
+					"Map maximum:",
+					np.max(
+						display_points_w,
+						axis=0,
+					),
+				)
+
+				print(
+					"Map dtype:",
+					display_points_w.dtype,
+				)
 
 				if not viewer_running:
 					break
@@ -298,58 +489,6 @@ def main() -> None:
 				cv2.imshow("combinedImage", combinedImage)
 
 				# cv2.waitKey(1)
-
-			"""
-			MAP MATHCING SECTION
-			Map Matching algorithms is applied here
-			"""
-
-			# Simple two step map matching
-
-			if match_result.matched:
-				map_matched_positions_xy_utm.append(
-					match_result.corrected_xy.copy()
-				)
-				map_matched_headings.append(
-					match_result.corrected_heading
-				)
-				map_matching_distances.append(
-					match_result.distance
-				)
-				map_matching_costs.append(
-					match_result.cost
-				)
-				osm_plotter.update_map_matched(
-					match_result.corrected_xy
-				)
-				print(
-					"[MAP MATCH]",
-					"distance:",
-					f"{match_result.distance:.2f}",
-					"lateral:",
-					f"{match_result.lateral_residual:.2f}",
-					"heading error deg:",
-					f"{np.rad2deg(match_result.heading_error):.2f}",
-					"cost:",
-					f"{match_result.cost:.2f}",
-				)
-
-			else:
-				map_matched_positions_xy_utm.append(
-					lidar_xy_utm.copy()
-				)
-				osm_plotter.update_map_matched(
-					lidar_xy_utm
-				)
-
-			# General Map mathcing Algo for Transport Telematics
-			# if lidar_xy_utm is None or vehicle_heading_utm is None:
-			# 	continue
-			# else:
-			# 	general_map_mathcer.run(esikf.state.copy(), lidar_xy_utm, vehicle_heading_utm)
-
-
-
 
 	finally:
 		# path save
@@ -380,7 +519,7 @@ def main() -> None:
 			)
 
 			lidar_viewer.close()
-			osm_plotter.close()
+			# osm_plotter.close()
 			cv2.destroyAllWindows()
 
 

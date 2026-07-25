@@ -10,13 +10,17 @@ class LidarViewer:
 	"""
 	Non-blocking Open3D viewer.
 
+	The estimator may use absolute UTM coordinates. Open3D instead receives
+	coordinates relative to the first corrected vehicle position. This avoids
+	rendering and camera precision problems at large UTM coordinates.
+
 	Visualization:
-	- blue sphere: world origin
+	- blue sphere: display origin (first corrected vehicle position)
 	- red sphere: IMU-only predicted position
 	- green sphere: LiDAR-corrected position
 	- coordinate frame: LiDAR-corrected body orientation
 
-	The camera follows the LiDAR-corrected vehicle position.
+	The public update API still accepts world/UTM coordinates.
 	"""
 
 	def __init__(
@@ -50,16 +54,16 @@ class LidarViewer:
 		self.first_update = True
 		self.is_open = True
 
-		# -----------------------------------------------------
-		# Point cloud map
-		# -----------------------------------------------------
+		# Absolute world/UTM position represented as [0, 0, 0] in
+		# the viewer. It is set on the first valid update.
+		self.display_origin_w: np.ndarray | None = None
+
 		self.point_cloud = (
 			o3d.geometry.PointCloud()
 		)
 
-		# -----------------------------------------------------
-		# Fixed world-origin marker: blue
-		# -----------------------------------------------------
+		# This marker is fixed at the viewer origin. Once the first update
+		# arrives, it represents display_origin_w rather than global UTM zero.
 		self.origin_marker = (
 			o3d.geometry.TriangleMesh
 			.create_sphere(radius=0.5)
@@ -69,9 +73,6 @@ class LidarViewer:
 			[0.0, 0.2, 1.0]
 		)
 
-		# -----------------------------------------------------
-		# IMU-only prediction marker: red
-		# -----------------------------------------------------
 		self.imu_marker = (
 			o3d.geometry.TriangleMesh
 			.create_sphere(radius=0.6)
@@ -81,9 +82,6 @@ class LidarViewer:
 			[1.0, 0.0, 0.0]
 		)
 
-		# -----------------------------------------------------
-		# LiDAR-corrected position marker: green
-		# -----------------------------------------------------
 		self.corrected_marker = (
 			o3d.geometry.TriangleMesh
 			.create_sphere(radius=0.7)
@@ -93,23 +91,23 @@ class LidarViewer:
 			[0.0, 1.0, 0.0]
 		)
 
-		# Body orientation frame at corrected pose.
 		self.corrected_pose_frame = (
 			o3d.geometry.TriangleMesh
 			.create_coordinate_frame(size=2.5)
 		)
 
-		self.current_imu_position = np.zeros(
+		# These positions are display-relative, not absolute UTM values.
+		self.current_imu_position_display = np.zeros(
 			3,
 			dtype=np.float64,
 		)
 
-		self.current_corrected_position = np.zeros(
+		self.current_corrected_position_display = np.zeros(
 			3,
 			dtype=np.float64,
 		)
 
-		self.current_pose_transform = np.eye(
+		self.current_pose_transform_display = np.eye(
 			4,
 			dtype=np.float64,
 		)
@@ -145,6 +143,29 @@ class LidarViewer:
 
 		render_options.point_size = point_size
 
+	def _world_to_display(
+		self,
+		values_w: np.ndarray,
+	) -> np.ndarray:
+		"""
+		Return a new array centered at the fixed display origin.
+
+		The subtraction is deliberately not performed in place, so the
+		estimator/local-map arrays supplied by the caller are never modified.
+		"""
+		if self.display_origin_w is None:
+			raise RuntimeError(
+				"Display origin has not been initialized."
+			)
+
+		return (
+			np.asarray(
+				values_w,
+				dtype=np.float64,
+			)
+			- self.display_origin_w
+		)
+
 	def update(
 		self,
 		points_w: np.ndarray,
@@ -153,13 +174,11 @@ class LidarViewer:
 		corrected_quaternion_wb: np.ndarray,
 	) -> bool:
 		"""
-		Update the map, pose markers and camera.
+		Update the map, pose markers, orientation frame and camera.
 
-		The camera follows corrected_position_w, while the red
-		and green markers allow comparison between the IMU
-		prediction and LiDAR-corrected state.
+		Inputs remain in the estimator world frame (including absolute UTM).
+		Only temporary copies sent to Open3D are centered for rendering.
 		"""
-
 		if not self.is_open:
 			return False
 
@@ -188,20 +207,57 @@ class LidarViewer:
 				"Viewer points contain NaN or infinity."
 			)
 
-		# -----------------------------------------------------
-		# Update map point cloud
-		# -----------------------------------------------------
+		if not np.all(np.isfinite(imu_position_w)):
+			raise ValueError(
+				"IMU position contains NaN or infinity."
+			)
+
+		if not np.all(np.isfinite(corrected_position_w)):
+			raise ValueError(
+				"Corrected position contains NaN or infinity."
+			)
+
+		if not np.all(np.isfinite(corrected_quaternion_wb)):
+			raise ValueError(
+				"Corrected quaternion contains NaN or infinity."
+			)
+
+		# The first corrected position becomes the fixed numerical origin
+		# used only by the renderer.
+		if self.display_origin_w is None:
+			self.display_origin_w = (
+				corrected_position_w.copy()
+			)
+
+			print(
+				"LiDAR viewer display origin [world/UTM]:",
+				self.display_origin_w,
+			)
+
+		points_display = self._world_to_display(
+			points_w
+		)
+
+		imu_position_display = self._world_to_display(
+			imu_position_w
+		)
+
+		corrected_position_display = self._world_to_display(
+			corrected_position_w
+		)
+
+		# Update the centered point cloud.
 		self.point_cloud.points = (
 			o3d.utility.Vector3dVector(
-				points_w
+				points_display
 			)
 		)
 
-		if len(points_w) > 0:
+		if len(points_display) > 0:
 			self.point_cloud.colors = (
 				o3d.utility.Vector3dVector(
 					self._height_colors(
-						points_w
+						points_display
 					)
 				)
 			)
@@ -210,108 +266,92 @@ class LidarViewer:
 			self.point_cloud
 		)
 
-		# -----------------------------------------------------
-		# Move red IMU marker
-		# -----------------------------------------------------
+		# Move the IMU marker using display-relative coordinates.
 		imu_translation = (
-			imu_position_w
-			- self.current_imu_position
+			imu_position_display
+			- self.current_imu_position_display
 		)
 
 		self.imu_marker.translate(
-			imu_translation
+			imu_translation,
+			relative=True,
 		)
 
-		self.current_imu_position = (
-			imu_position_w.copy()
+		self.current_imu_position_display = (
+			imu_position_display.copy()
 		)
 
 		self.visualizer.update_geometry(
 			self.imu_marker
 		)
 
-		# -----------------------------------------------------
-		# Move green LiDAR-corrected marker
-		# -----------------------------------------------------
+		# Move the corrected marker using display-relative coordinates.
 		corrected_translation = (
-			corrected_position_w
-			- self.current_corrected_position
+			corrected_position_display
+			- self.current_corrected_position_display
 		)
 
 		self.corrected_marker.translate(
-			corrected_translation
+			corrected_translation,
+			relative=True,
 		)
 
-		self.current_corrected_position = (
-			corrected_position_w.copy()
+		self.current_corrected_position_display = (
+			corrected_position_display.copy()
 		)
 
 		self.visualizer.update_geometry(
 			self.corrected_marker
 		)
 
-		# -----------------------------------------------------
-		# Update corrected body pose frame
-		# -----------------------------------------------------
+		# Update the corrected orientation frame. Rotation is unchanged;
+		# only the translation is expressed relative to display_origin_w.
 		rotation_wb = (
 			quaternion_to_rotation_matrix(
 				corrected_quaternion_wb
 			)
 		)
 
-		new_pose_transform = np.eye(
+		new_pose_transform_display = np.eye(
 			4,
 			dtype=np.float64,
 		)
 
-		new_pose_transform[:3, :3] = (
+		new_pose_transform_display[:3, :3] = (
 			rotation_wb
 		)
 
-		new_pose_transform[:3, 3] = (
-			corrected_position_w
+		new_pose_transform_display[:3, 3] = (
+			corrected_position_display
 		)
 
-		# Remove previous transform before applying the new one.
 		self.corrected_pose_frame.transform(
 			np.linalg.inv(
-				self.current_pose_transform
+				self.current_pose_transform_display
 			)
 		)
 
 		self.corrected_pose_frame.transform(
-			new_pose_transform
+			new_pose_transform_display
 		)
 
-		self.current_pose_transform = (
-			new_pose_transform.copy()
+		self.current_pose_transform_display = (
+			new_pose_transform_display.copy()
 		)
 
 		self.visualizer.update_geometry(
 			self.corrected_pose_frame
 		)
 
-		# -----------------------------------------------------
-		# Make the camera follow the corrected vehicle
-		# -----------------------------------------------------
 		view_control = (
 			self.visualizer.get_view_control()
 		)
 
 		if self.follow_vehicle:
 			view_control.set_lookat(
-				corrected_position_w.tolist()
+				corrected_position_display.tolist()
 			)
 
-		# if self.first_update:
-		# 	view_control.set_lookat(
-		# 		corrected_position_w.tolist()
-		# 	)
-
-		# Configure viewing direction and zoom only once.
-		#
-		# Do not call set_zoom every update, otherwise manual
-		# mouse-wheel zoom will constantly be overwritten.
 		if self.first_update:
 			view_control.set_front(
 				[-0.8, -0.5, -0.35]
@@ -321,7 +361,7 @@ class LidarViewer:
 				[0.0, 0.0, 1.0]
 			)
 
-			# Smaller value means farther away.
+			# Smaller values move the camera farther away.
 			view_control.set_zoom(
 				self.initial_zoom
 			)
@@ -342,9 +382,9 @@ class LidarViewer:
 
 	@staticmethod
 	def _height_colors(
-		points_w: np.ndarray,
+		points_display: np.ndarray,
 	) -> np.ndarray:
-		z_values = points_w[:, 2]
+		z_values = points_display[:, 2]
 
 		z_min = float(
 			np.percentile(
@@ -381,7 +421,9 @@ class LidarViewer:
 			)
 		)
 
-	def close(self) -> None:
+	def close(
+		self,
+	) -> None:
 		if self.is_open:
 			self.visualizer.destroy_window()
 			self.is_open = False

@@ -339,10 +339,55 @@ def rotation_matrix_2d(
 
 
 def estimate_heading_from_points(
-	points_xy: np.ndarray,
+	sequence_path: str,
+	geojson_path: str,
 	start_index: int = 0,
 	end_index: int = 20,
 ) -> float:
+
+	if not geojson_path.exists():
+		raise FileNotFoundError(
+			f"File not found: {geojson_path}"
+		)
+	roads = gpd.read_file(
+		geojson_path
+	)
+	if roads.empty:
+		raise ValueError(
+			"The GeoJSON contains no road features."
+		)
+
+	metric_crs = roads.estimate_utm_crs()
+	if metric_crs is None:
+		raise RuntimeError(
+			"Could not determine a local UTM CRS."
+		)
+	roads = roads.to_crs(
+		metric_crs
+	)
+
+	oxts_latitudes, oxts_longitudes = (
+		read_oxts_lat_lon_sequence(
+			sequence_path,
+			maximum_count=30,
+		)
+	)
+
+	points_xy = np.asarray(
+		[
+			geodetic_to_metric_xy(
+				latitude=latitude,
+				longitude=longitude,
+				target_crs=roads.crs
+			)
+			for latitude, longitude in zip(
+				oxts_latitudes,
+				oxts_longitudes,
+			)
+		],
+		dtype=np.float64,
+	)
+
 	points_xy = np.asarray(
 		points_xy,
 		dtype=np.float64,
@@ -423,3 +468,24 @@ def read_oxts_lat_lon_sequence(
 			dtype=np.float64,
 		),
 	)
+
+def read_oxts_yaw_rad(
+	sequence_path: Path,
+	frame_index: int = 0,
+) -> float:
+	oxts_path = (
+		Path(sequence_path)
+		/ "oxts"
+		/ "data"
+		/ f"{frame_index:010d}.txt"
+	)
+
+	values = np.loadtxt(
+		oxts_path,
+		dtype=np.float64,
+	).reshape(-1)
+
+	# KITTI OXTS ordering:
+	# latitude, longitude, altitude,
+	# roll, pitch, yaw, ...
+	return float(values[5])
