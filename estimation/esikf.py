@@ -8,7 +8,12 @@ from sensors.measurements import ImuMeasurement
 from geometry.quaternion import (quaternion_to_rotation_matrix,
 								 rotation_vector_to_quaternion,
 								 quaternion_multiply,
-								 normalize_quaternion)
+								 normalize_quaternion,
+								 rotation_matrix_to_quaternion,
+								 rotation_x,
+								 rotation_y,
+								 rotation_z)
+
 from geometry.transforms import (transform_body_to_world)
 from config.variables import (POS, STATE_DIM,
 							  ROT, GYRO_BIAS,
@@ -56,14 +61,21 @@ class LidarUpdateResult:
     corrected_points_w: np.ndarray
     initialized_map: bool
 
+@dataclass
+class OxtsInitialization:
+    roll: float
+    pitch: float
+    yaw: float
+    velocity_world: np.ndarray
+
 
 class ESIKF:
 	def __init__(
 			self,
 			sequencePath: str,
 			initial_lat_long: np.ndarray,
-			oxts_heading_rad: float
-			):
+			initial_oxts_packet: np.ndarray,
+	):
 		self.state = ESIKFState()
 		self.previous_imu: ImuMeasurement | None = None
 		self.state_history: list[ESIKFState] = [
@@ -91,25 +103,26 @@ class ESIKF:
 			dtype=np.float64,
 		)
 
-		oxts_heading_rad = read_oxts_yaw_rad(
-			sequencePath
+		self.initialize_from_oxts(
+			initial_oxts_packet
 		)
 
-		self.state.quaternion_wb = np.array(
-			[
-				np.cos(oxts_heading_rad / 2.0),
-				0.0,
-				0.0,
-				np.sin(oxts_heading_rad / 2.0),
-			],
-			dtype=np.float64,
+		print(
+			"Initial ESIKF velocity:",
+			self.state.velocity_wb
 		)
+
+		# Visualization variables for plotting error
+		# IMU debug data
+		self.debug_imu_timestamps: list[float] = []
+		self.debug_accelerations_b: list[np.ndarray] = []
+		self.debug_gyros_b: list[np.ndarray] = []
 
 
 		self.gyro_noise_sigma = 0.01
-		self.accel_noise_sigma = 0.10
-		self.gyro_bias_random_walk_sigma = 0.001
-		self.accel_bias_random_walk_sigma = 0.01
+		self.accel_noise_sigma = 0.01
+		self.gyro_bias_random_walk_sigma = 0.1
+		self.accel_bias_random_walk_sigma = 0.1
 
 		# Lidar variables
 		self.SEQUENCE_PATH = sequencePath
@@ -197,6 +210,18 @@ class ESIKF:
 			+ measurement.angular_velocity
 		)
 
+		self.debug_imu_timestamps.append(
+			float(measurement.timestamp)
+		)
+
+		self.debug_accelerations_b.append(
+			acceleration_mid.copy()
+		)
+
+		self.debug_gyros_b.append(
+			angular_velocity_mid.copy()
+)
+
 		corrected_angular_velocity = (
 			angular_velocity_mid
 			- self.state.gyro_bias
@@ -216,6 +241,71 @@ class ESIKF:
 			rotation_wb @ corrected_specific_force
 			+ self.state.gravity_w
 		)
+
+		velocity_xy = self.state.velocity_wb[:2]
+		speed_xy = np.linalg.norm(velocity_xy)
+
+		if speed_xy > 1.0:
+			forward_world = velocity_xy / speed_xy
+
+			left_world = np.array(
+				[
+					-forward_world[1],
+					forward_world[0],
+				],
+				dtype=np.float64,
+			)
+
+			actual_lateral_acceleration = float(
+				left_world @ acceleration_world[:2]
+			)
+
+			expected_lateral_acceleration = float(
+				speed_xy * corrected_angular_velocity[2]
+			)
+
+			roll, pitch, yaw = Rotation.from_quat(
+				self.state.quaternion_wb,
+				scalar_first=True,
+			).as_euler(
+				"xyz",
+				degrees=True,
+			)
+
+			print(
+				"roll/pitch/yaw:",
+				roll,
+				pitch,
+				yaw,
+				"| gravity:",
+				self.state.gravity_w,
+				"norm:",
+				np.linalg.norm(self.state.gravity_w),
+				"| lateral accel actual:",
+				actual_lateral_acceleration,
+				"expected from gyro:",
+				expected_lateral_acceleration,
+			)
+
+		velocity_xy = self.state.velocity_wb[:2]
+		acceleration_xy = acceleration_world[:2]
+
+		speed_squared = float(
+			velocity_xy @ velocity_xy
+		)
+
+		if speed_squared > 1.0:
+			velocity_heading_rate = (
+				velocity_xy[0] * acceleration_xy[1]
+				- velocity_xy[1] * acceleration_xy[0]
+			) / speed_squared
+
+			print(
+				"gyro wz:",
+				corrected_angular_velocity[2],
+				"velocity heading rate:",
+				velocity_heading_rate,
+			)
 
 		old_position = self.state.position_wb.copy()
 		old_velocity = self.state.velocity_wb.copy()
@@ -444,7 +534,7 @@ class ESIKF:
 			)
 
 			self.local_map.add_points(
-				corrected_points_w[::2]
+				corrected_points_w
 			)
 
 			initialized_map = True
@@ -456,12 +546,17 @@ class ESIKF:
 			)
 
 		else:
-			update_points_b = points_b[::7]
+			update_points_b = points_b[::10]
+
+			predicted_velocity_wb = (
+				self.state.velocity_wb.copy()
+			)
 
 			(
 				corrected_quaternion_wb,
 				corrected_position_wb,
 				corrected_state,
+				update_accepted,
 			) = correct_pose_with_lidar(
 				points_b=update_points_b,
 				state=self.state,
@@ -475,62 +570,59 @@ class ESIKF:
 				maximum_iterations=7,
 			)
 
-			self.state = corrected_state
-
-			self.state.quaternion_wb = (
-				corrected_quaternion_wb.copy()
+			print(
+				"LiDAR velocity correction:",
+				corrected_state.velocity_wb
+				- predicted_velocity_wb
 			)
 
-			self.state.position_wb = (
-				corrected_position_wb.copy()
-			)
 
-			corrected_rotation_wb = (
-				quaternion_to_rotation_matrix(
-					corrected_quaternion_wb
+
+			if update_accepted:
+				self.state = corrected_state
+
+				corrected_rotation_wb = (
+					quaternion_to_rotation_matrix(
+						corrected_quaternion_wb
+					)
 				)
-			)
 
-			# Use the complete processed scan for mapping,
-			# not only the sparse optimization points.
-			corrected_points_w = (
-				transform_body_to_world(
-					points_b=points_b,
-					rotation_wb=(
-						corrected_rotation_wb
-					),
-					position_wb=(
-						corrected_position_wb
-					),
+				corrected_points_w = (
+					transform_body_to_world(
+						points_b=points_b,
+						rotation_wb=(
+							corrected_rotation_wb
+						),
+						position_wb=(
+							corrected_position_wb
+						),
+					)
 				)
-			)
 
-			self.local_map.add_points(
-				corrected_points_w[::3]
-			)
+				# Only an accepted scan is allowed to modify
+				# the permanent local map.
+				self.local_map.add_points(
+					corrected_points_w[::3]
+				)
 
-			position_correction = (
-				corrected_position_wb
-				- predicted_position_wb
-			)
+			else:
+				# Keep the IMU-predicted pose.
+				corrected_quaternion_wb = (
+					predicted_quaternion_wb.copy()
+				)
 
-			# print(
-			# 	"LiDAR position correction:",
-			# 	position_correction,
-			# )
+				corrected_position_wb = (
+					predicted_position_wb.copy()
+				)
 
-		# Store independent snapshots.
-		self.lidar_timestamps.append(
-			float(lidar_measurement.timestamp)
-		)
+				corrected_points_w = (
+					predicted_points_w.copy()
+				)
 
-		self.lidar_positions_w.append(
-			corrected_position_wb.copy()
-		)
-
-		self.lidar_quaternions_wb.append(
-			corrected_quaternion_wb.copy()
-		)
+				print(
+					"LiDAR scan rejected; "
+					"local map was not modified."
+				)
 
 
 		result = LidarUpdateResult(
@@ -556,6 +648,57 @@ class ESIKF:
 		self.lidar_frame_index += 1
 
 		return result
+
+	def initialize_from_oxts(
+		self,
+		packet: np.ndarray,
+	):
+		roll = float(packet[3])
+		pitch = float(packet[4])
+		yaw = float(packet[5])
+
+		R_wb = (
+			rotation_z(yaw)
+			@ rotation_y(pitch)
+			@ rotation_x(roll)
+		)
+
+		self.state.quaternion_wb = (
+			rotation_matrix_to_quaternion(
+				R_wb
+			)
+		)
+
+		# velocity_body = np.array(
+		# 	[
+		# 		packet[8],   # forward
+		# 		packet[9],   # left
+		# 		packet[10],  # up
+		# 	],
+		# 	dtype=np.float64,
+		# )
+
+		# self.state.velocity_wb = (
+		# 	R_wb @ velocity_body
+		# )
+
+		self.state.velocity_wb = np.array(
+			[
+				packet[7],   # ve: east velocity
+				packet[6],   # vn: north velocity
+				packet[10],  # vu: upward velocity
+			],
+			dtype=np.float64,
+		)
+
+		print(
+			"Initial velocity world:",
+			self.state.velocity_wb,
+			"speed:",
+			np.linalg.norm(
+				self.state.velocity_wb
+			),
+		)
 
 	# Helper Functions
 	def _geodetic_to_metric_xy(
@@ -803,6 +946,7 @@ class ESIKF:
 		self.state.velocity_wb += delta_state[7:10]
 		self.state.gyro_bias += delta_state[10:13]
 		self.state.accel_bias += delta_state[13:16]
-		self.state.gravity_w += delta_state[16:19]
+		# self.state.gravity_w += delta_state[16:19]
+		self.state.gravity_w += 0.0
 
 

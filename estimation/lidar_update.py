@@ -13,6 +13,9 @@ from geometry.transforms import transform_body_to_world
 from estimation.state import ESIKFState
 
 
+from scipy.spatial.transform import Rotation
+
+
 @dataclass
 class LidarResidualResult:
 	residuals: np.ndarray
@@ -599,6 +602,13 @@ def inject_error_state(
 		state.quaternion_wb
 	)
 
+	print(
+		"LiDAR error-state correction:",
+		"rotation =", delta_x[0:3],
+		"position =", delta_x[3:6],
+		"velocity =", delta_x[7:10],
+	)
+
 	state.position_wb += delta_x[3:6]
 	state.inverse_exposure_time += delta_x[6]
 	state.velocity_wb += delta_x[7:10]
@@ -615,10 +625,135 @@ def correct_pose_with_lidar(
 	initial_position_wb: np.ndarray,
 	local_map: LocalMap,
 	maximum_iterations: int = 5,
-) -> tuple[np.ndarray, np.ndarray, ESIKFState]:
+) -> tuple[
+	np.ndarray,
+	np.ndarray,
+	ESIKFState,
+	bool,
+]:
 	"""
-	Iterative scan-to-map point-to-plane pose correction.
+	Iterative scan-to-map correction followed by a Kalman
+	pose-measurement update.
+
+	The scan matcher estimates a LiDAR pose measurement.
+
+	The Kalman gain decides how much of that measurement is
+	applied based on:
+
+	    P: predicted ESIKF covariance
+	    R: LiDAR pose-measurement covariance
+
+	Returns
+	-------
+	corrected_quaternion_wb
+	corrected_position_wb
+	corrected_state
+	update_accepted
 	"""
+
+	# -------------------------------------------------
+	# Validation and outlier-gating parameters
+	# -------------------------------------------------
+
+	minimum_correspondences = 100
+
+	maximum_iteration_rotation = np.deg2rad(
+		5.0
+	)
+
+	maximum_iteration_translation = 1.0
+
+	maximum_total_rotation = np.deg2rad(
+		15.0
+	)
+
+	maximum_total_translation = 3.0
+
+	maximum_final_residual_rms = 0.40
+
+	# Innovation gate for six pose dimensions.
+	maximum_nis = 30.0
+
+	# Minimum LiDAR noise floor.
+	#
+	# This is R's minimum uncertainty, not an arbitrary
+	# correction weight.
+	rotation_noise_floor = np.deg2rad(
+		0.5
+	)
+
+	position_noise_floor = 0.05
+
+	# -------------------------------------------------
+	# Input preparation
+	# -------------------------------------------------
+
+	points_b = np.asarray(
+		points_b,
+		dtype=np.float64,
+	).reshape(-1, 3)
+
+	initial_quaternion_wb = np.asarray(
+		initial_quaternion_wb,
+		dtype=np.float64,
+	).reshape(4)
+
+	initial_position_wb = np.asarray(
+		initial_position_wb,
+		dtype=np.float64,
+	).reshape(3)
+
+	if len(points_b) < 6:
+		print(
+			"Rejected LiDAR update: "
+			"not enough input points:",
+			len(points_b),
+		)
+
+		return (
+			initial_quaternion_wb.copy(),
+			initial_position_wb.copy(),
+			state.copy(),
+			False,
+		)
+
+	quaternion_norm = float(
+		np.linalg.norm(
+			initial_quaternion_wb
+		)
+	)
+
+	if quaternion_norm < 1e-12:
+		raise ValueError(
+			"Initial quaternion has zero norm."
+		)
+
+	initial_quaternion_wb = (
+		initial_quaternion_wb
+		/ quaternion_norm
+	)
+
+	state_dimension = (
+		state.covariance.shape[0]
+	)
+
+	if state.covariance.shape != (
+		state_dimension,
+		state_dimension,
+	):
+		raise ValueError(
+			"State covariance must be square."
+		)
+
+	if state_dimension < 19:
+		raise ValueError(
+			"Expected an error state with at least "
+			"19 dimensions."
+		)
+
+	# -------------------------------------------------
+	# Predicted pose
+	# -------------------------------------------------
 
 	quaternion_wb = (
 		initial_quaternion_wb.copy()
@@ -627,6 +762,19 @@ def correct_pose_with_lidar(
 	position_wb = (
 		initial_position_wb.copy()
 	)
+
+	initial_rotation_wb = (
+		quaternion_to_rotation_matrix(
+			initial_quaternion_wb
+		)
+	)
+
+	applied_valid_step = False
+	initial_residual_rms: float | None = None
+
+	# -------------------------------------------------
+	# Iterative scan-to-map pose optimization
+	# -------------------------------------------------
 
 	for iteration in range(
 		maximum_iterations
@@ -653,16 +801,44 @@ def correct_pose_with_lidar(
 			maximum_absolute_residual=1.0,
 		)
 
-		if (
+		correspondence_count = (
 			result.number_of_correspondences
-			< 30
+		)
+
+		if (
+			correspondence_count
+			< minimum_correspondences
 		):
 			print(
-				"Not enough LiDAR correspondences:",
-				result.number_of_correspondences,
+				"Rejected LiDAR iteration:",
+				"correspondences =",
+				correspondence_count,
 			)
 
 			break
+
+		residual_rms = float(
+			np.sqrt(
+				np.mean(
+					result.residuals**2
+				)
+			)
+		)
+
+		if not np.isfinite(
+			residual_rms
+		):
+			print(
+				"Rejected LiDAR iteration: "
+				"invalid residual RMS."
+			)
+
+			break
+
+		if initial_residual_rms is None:
+			initial_residual_rms = (
+				residual_rms
+			)
 
 		jacobian = build_pose_jacobian(
 			current_points_b=(
@@ -674,12 +850,34 @@ def correct_pose_with_lidar(
 			rotation_wb=rotation_wb,
 		)
 
-
 		delta_pose = solve_pose_correction(
 			jacobian=jacobian,
 			residuals=result.residuals,
 		)
 
+		delta_pose = np.asarray(
+			delta_pose,
+			dtype=np.float64,
+		).reshape(-1)
+
+		if delta_pose.shape != (6,):
+			raise ValueError(
+				"solve_pose_correction must return "
+				"shape (6,)."
+			)
+
+		if not np.all(
+			np.isfinite(
+				delta_pose
+			)
+		):
+			print(
+				"Rejected LiDAR iteration: "
+				"non-finite correction:",
+				delta_pose,
+			)
+
+			break
 
 		delta_rotation = (
 			delta_pose[0:3]
@@ -689,76 +887,682 @@ def correct_pose_with_lidar(
 			delta_pose[3:6]
 		)
 
+		step_rotation_norm = float(
+			np.linalg.norm(
+				delta_rotation
+			)
+		)
+
+		step_translation_norm = float(
+			np.linalg.norm(
+				delta_position
+			)
+		)
+
+		if (
+			step_rotation_norm
+			> maximum_iteration_rotation
+			or
+			step_translation_norm
+			> maximum_iteration_translation
+		):
+			print(
+				"Rejected LiDAR step:",
+				"iteration =",
+				iteration,
+				"rotation [deg] =",
+				np.rad2deg(
+					step_rotation_norm
+				),
+				"translation [m] =",
+				step_translation_norm,
+			)
+
+			break
+
 		delta_quaternion = (
 			rotation_vector_to_quaternion(
 				delta_rotation
 			)
 		)
 
-		quaternion_wb = quaternion_multiply(
-			quaternion_wb,
-			delta_quaternion,
+		candidate_quaternion_wb = (
+			quaternion_multiply(
+				quaternion_wb,
+				delta_quaternion,
+			)
 		)
 
-		quaternion_wb /= np.linalg.norm(
-			quaternion_wb
+		candidate_norm = float(
+			np.linalg.norm(
+				candidate_quaternion_wb
+			)
 		)
 
-		position_wb += delta_position
+		if candidate_norm < 1e-12:
+			print(
+				"Rejected LiDAR step: "
+				"invalid quaternion."
+			)
 
-		# print(
-		# 	f"  iteration {iteration}: "
-		# 	f"correspondences="
-		# 	f"{result.number_of_correspondences}, "
-		# 	f"|dtheta|="
-		# 	f"{np.linalg.norm(delta_rotation):.6f}, "
-		# 	f"|dp|="
-		# 	f"{np.linalg.norm(delta_position):.6f}"
-		# )
+			break
+
+		candidate_quaternion_wb /= (
+			candidate_norm
+		)
+
+		candidate_position_wb = (
+			position_wb
+			+ delta_position
+		)
+
+		# Validate the candidate correction by rebuilding
+		# correspondences at the candidate pose.
+		candidate_rotation_wb = (
+			quaternion_to_rotation_matrix(
+				candidate_quaternion_wb
+			)
+		)
+
+		candidate_points_w = (
+			transform_body_to_world(
+				points_b=points_b,
+				rotation_wb=(
+					candidate_rotation_wb
+				),
+				position_wb=(
+					candidate_position_wb
+				),
+			)
+		)
+
+		candidate_result = (
+			build_lidar_residuals(
+				current_points_b=points_b,
+				current_points_w=(
+					candidate_points_w
+				),
+				local_map=local_map,
+				number_of_neighbors=5,
+				maximum_neighbor_distance=1.5,
+				maximum_planarity_ratio=0.03,
+				maximum_absolute_residual=1.0,
+			)
+		)
 
 		if (
-			np.linalg.norm(
-				delta_rotation
+			candidate_result
+			.number_of_correspondences
+			< minimum_correspondences
+		):
+			print(
+				"Rejected LiDAR candidate:",
+				"correspondences dropped from",
+				correspondence_count,
+				"to",
+				candidate_result
+				.number_of_correspondences,
 			)
-			< 1e-4
+
+			break
+
+		candidate_residual_rms = float(
+			np.sqrt(
+				np.mean(
+					candidate_result
+					.residuals**2
+				)
+			)
+		)
+
+		if not np.isfinite(
+			candidate_residual_rms
+		):
+			print(
+				"Rejected LiDAR candidate: "
+				"invalid residual RMS."
+			)
+
+			break
+
+		if (
+			candidate_residual_rms
+			> 1.10 * residual_rms
+		):
+			print(
+				"Rejected LiDAR candidate:",
+				"RMS increased from",
+				residual_rms,
+				"to",
+				candidate_residual_rms,
+			)
+
+			break
+
+		quaternion_wb = (
+			candidate_quaternion_wb
+		)
+
+		position_wb = (
+			candidate_position_wb
+		)
+
+		applied_valid_step = True
+
+		if (
+			step_rotation_norm < 1e-4
 			and
-			np.linalg.norm(
-				delta_position
-			)
-			< 1e-3
+			step_translation_norm < 1e-3
 		):
 			break
-	H = build_state_jacobian(
-		pose_jacobian=jacobian,
-		state_dimension=state.covariance.shape[0],
+
+	if not applied_valid_step:
+		return (
+			initial_quaternion_wb.copy(),
+			initial_position_wb.copy(),
+			state.copy(),
+			False,
+		)
+
+	# -------------------------------------------------
+	# Build final LiDAR residuals and Jacobian
+	# -------------------------------------------------
+
+	optimized_rotation_wb = (
+		quaternion_to_rotation_matrix(
+			quaternion_wb
+		)
 	)
 
-	measurement_variance = 0.05**2
-	R_measurement = (
-		measurement_variance
-		* np.eye(result.number_of_correspondences)
+	optimized_points_w = (
+		transform_body_to_world(
+			points_b=points_b,
+			rotation_wb=(
+				optimized_rotation_wb
+			),
+			position_wb=position_wb,
+		)
 	)
 
-	P = state.covariance.copy()
+	final_result = build_lidar_residuals(
+		current_points_b=points_b,
+		current_points_w=optimized_points_w,
+		local_map=local_map,
+		number_of_neighbors=5,
+		maximum_neighbor_distance=1.5,
+		maximum_planarity_ratio=0.03,
+		maximum_absolute_residual=1.0,
+	)
 
-	S = H @ P @ H.T + R_measurement
+	final_correspondence_count = (
+		final_result.number_of_correspondences
+	)
 
-	# Numerically preferable to explicitly computing inv(S).
-	K = np.linalg.solve(
-		S,
-		H @ P,
+	if (
+		final_correspondence_count
+		< minimum_correspondences
+	):
+		print(
+			"Rejected final LiDAR pose:",
+			"correspondences =",
+			final_correspondence_count,
+		)
+
+		return (
+			initial_quaternion_wb.copy(),
+			initial_position_wb.copy(),
+			state.copy(),
+			False,
+		)
+
+	final_residual_rms = float(
+		np.sqrt(
+			np.mean(
+				final_result.residuals**2
+			)
+		)
+	)
+
+	final_pose_jacobian = (
+		build_pose_jacobian(
+			current_points_b=(
+				final_result.current_points_b
+			),
+			plane_normals_w=(
+				final_result.plane_normals_w
+			),
+			rotation_wb=(
+				optimized_rotation_wb
+			),
+		)
+	)
+
+	# -------------------------------------------------
+	# Pose innovation
+	# -------------------------------------------------
+
+	relative_rotation = (
+		initial_rotation_wb.T
+		@ optimized_rotation_wb
+	)
+
+	rotation_innovation = (
+		Rotation.from_matrix(
+			relative_rotation
+		).as_rotvec()
+	)
+
+	position_innovation = (
+		position_wb
+		- initial_position_wb
+	)
+
+	pose_innovation = np.concatenate(
+		[
+			rotation_innovation,
+			position_innovation,
+		]
+	)
+
+	total_rotation_norm = float(
+		np.linalg.norm(
+			rotation_innovation
+		)
+	)
+
+	total_translation_norm = float(
+		np.linalg.norm(
+			position_innovation
+		)
+	)
+
+	if (
+		final_residual_rms
+		> maximum_final_residual_rms
+		or
+		total_rotation_norm
+		> maximum_total_rotation
+		or
+		total_translation_norm
+		> maximum_total_translation
+	):
+		print(
+			"Rejected final LiDAR measurement:",
+			"RMS =",
+			final_residual_rms,
+			"rotation [deg] =",
+			np.rad2deg(
+				total_rotation_norm
+			),
+			"translation [m] =",
+			total_translation_norm,
+		)
+
+		return (
+			initial_quaternion_wb.copy(),
+			initial_position_wb.copy(),
+			state.copy(),
+			False,
+		)
+
+	if (
+		initial_residual_rms is not None
+		and
+		final_residual_rms
+		> 1.10 * initial_residual_rms
+	):
+		print(
+			"Rejected final LiDAR measurement: "
+				"residual did not improve."
+		)
+
+		return (
+			initial_quaternion_wb.copy(),
+			initial_position_wb.copy(),
+			state.copy(),
+			False,
+		)
+
+	# -------------------------------------------------
+	# Estimate LiDAR pose covariance R from the
+	# point-to-plane Hessian
+	# -------------------------------------------------
+
+	robust_weights = huber_weights(
+		final_result.residuals,
+		threshold=0.3,
+	)
+
+	square_root_weights = np.sqrt(
+		robust_weights
+	)
+
+	weighted_jacobian = (
+		square_root_weights[:, None]
+		* final_pose_jacobian
+	)
+
+	weighted_residuals = (
+		square_root_weights
+		* final_result.residuals
+	)
+
+	pose_information_unscaled = (
+		weighted_jacobian.T
+		@ weighted_jacobian
+	)
+
+	degrees_of_freedom = max(
+		final_correspondence_count - 6,
+		1,
+	)
+
+	estimated_point_variance = float(
+		weighted_residuals
+		@ weighted_residuals
+		/ degrees_of_freedom
+	)
+
+	# Do not claim better point-to-plane precision than
+	# the nominal LiDAR residual noise.
+	estimated_point_variance = max(
+		estimated_point_variance,
+		0.05**2,
+	)
+
+	information_eigenvalues, information_eigenvectors = (
+		np.linalg.eigh(
+			pose_information_unscaled
+		)
+	)
+
+	maximum_information = max(
+		float(
+			information_eigenvalues[-1]
+		),
+		1e-12,
+	)
+
+	observable_threshold = (
+		1e-6
+		* maximum_information
+	)
+
+	pose_variances = np.empty(
+		6,
+		dtype=np.float64,
+	)
+
+	for index, eigenvalue in enumerate(
+		information_eigenvalues
+	):
+		if (
+			eigenvalue
+			> observable_threshold
+		):
+			pose_variances[index] = (
+				estimated_point_variance
+				/ eigenvalue
+			)
+
+		else:
+			# Weakly observed ICP direction:
+			# give it huge uncertainty so the Kalman
+			# gain becomes small in that direction.
+			pose_variances[index] = 1e6
+
+	lidar_pose_covariance = (
+		information_eigenvectors
+		@ np.diag(
+			pose_variances
+		)
+		@ information_eigenvectors.T
+	)
+
+	# Add realistic minimum uncertainty.
+	lidar_pose_covariance += np.diag(
+		[
+			rotation_noise_floor**2,
+			rotation_noise_floor**2,
+			rotation_noise_floor**2,
+			position_noise_floor**2,
+			position_noise_floor**2,
+			position_noise_floor**2,
+		]
+	)
+
+	lidar_pose_covariance = (
+		0.5
+		* (
+			lidar_pose_covariance
+			+ lidar_pose_covariance.T
+		)
+	)
+
+	# -------------------------------------------------
+	# Kalman gain
+	# -------------------------------------------------
+
+	# Direct six-dimensional pose measurement:
+	#
+	# innovation =
+	# [
+	#     delta rotation,
+	#     delta position,
+	# ]
+
+	pose_measurement_jacobian = np.eye(
+		6,
+		dtype=np.float64,
+	)
+
+	state_jacobian = build_state_jacobian(
+		pose_jacobian=(
+			pose_measurement_jacobian
+		),
+		state_dimension=state_dimension,
+	)
+
+	covariance_prior = np.asarray(
+		state.covariance,
+		dtype=np.float64,
+	).copy()
+
+	covariance_prior = (
+		0.5
+		* (
+			covariance_prior
+			+ covariance_prior.T
+		)
+	)
+
+	projected_covariance = (
+		state_jacobian
+		@ covariance_prior
+		@ state_jacobian.T
+		+ lidar_pose_covariance
+	)
+
+	projected_covariance = (
+		0.5
+		* (
+			projected_covariance
+			+ projected_covariance.T
+		)
+	)
+
+	projected_covariance += (
+		1e-9
+		* np.eye(
+			6,
+			dtype=np.float64,
+		)
+	)
+
+	normalized_innovation_squared = float(
+		pose_innovation
+		@ np.linalg.solve(
+			projected_covariance,
+			pose_innovation,
+		)
+	)
+
+	if (
+		not np.isfinite(
+			normalized_innovation_squared
+		)
+		or
+		normalized_innovation_squared
+		> maximum_nis
+	):
+		print(
+			"Rejected LiDAR innovation:",
+			"NIS =",
+			normalized_innovation_squared,
+			"maximum =",
+			maximum_nis,
+		)
+
+		return (
+			initial_quaternion_wb.copy(),
+			initial_position_wb.copy(),
+			state.copy(),
+			False,
+		)
+
+	covariance_times_jacobian_transpose = (
+		covariance_prior
+		@ state_jacobian.T
+	)
+
+	kalman_gain = np.linalg.solve(
+		projected_covariance,
+		covariance_times_jacobian_transpose.T,
 	).T
 
-	# Correct sign for r(x ⊞ dx) ≈ r(x) + H dx.
-	delta_x = -K @ result.residuals
+	delta_x = (
+		kalman_gain
+		@ pose_innovation
+	)
 
-	state = inject_error_state(
+	# -------------------------------------------------
+	# Inject error-state correction
+	# -------------------------------------------------
+
+	corrected_state = inject_error_state(
 		state=state.copy(),
 		delta_x=delta_x,
 	)
 
+	# -------------------------------------------------
+	# Joseph covariance update
+	# -------------------------------------------------
+
+	identity = np.eye(
+		state_dimension,
+		dtype=np.float64,
+	)
+
+	correction_matrix = (
+		identity
+		- kalman_gain
+		@ state_jacobian
+	)
+
+	covariance_posterior = (
+		correction_matrix
+		@ covariance_prior
+		@ correction_matrix.T
+		+
+		kalman_gain
+		@ lidar_pose_covariance
+		@ kalman_gain.T
+	)
+
+	# ESKF covariance reset after right-multiplicative
+	# orientation-error injection.
+	reset_jacobian = np.eye(
+		state_dimension,
+		dtype=np.float64,
+	)
+
+	reset_jacobian[
+		0:3,
+		0:3,
+	] = (
+		np.eye(
+			3,
+			dtype=np.float64,
+		)
+		- 0.5
+		* skew(
+			delta_x[0:3]
+		)
+	)
+
+	covariance_posterior = (
+		reset_jacobian
+		@ covariance_posterior
+		@ reset_jacobian.T
+	)
+
+	corrected_state.covariance = (
+		0.5
+		* (
+			covariance_posterior
+			+ covariance_posterior.T
+		)
+	)
+
+	print(
+		"Accepted LiDAR Kalman update:",
+		"\n  correspondences =",
+		final_correspondence_count,
+		"\n  residual RMS =",
+		final_residual_rms,
+		"\n  NIS =",
+		normalized_innovation_squared,
+		"\n  raw rotation innovation [deg] =",
+		np.rad2deg(
+			rotation_innovation
+		),
+		"\n  raw position innovation [m] =",
+		position_innovation,
+		"\n  LiDAR rotation sigma [deg] =",
+		np.rad2deg(
+			np.sqrt(
+				np.maximum(
+					np.diag(
+						lidar_pose_covariance
+					)[0:3],
+					0.0,
+				)
+			)
+		),
+		"\n  LiDAR position sigma [m] =",
+		np.sqrt(
+			np.maximum(
+				np.diag(
+					lidar_pose_covariance
+				)[3:6],
+				0.0,
+			)
+		),
+		"\n  Kalman pose correction rotation [deg] =",
+		np.rad2deg(
+			delta_x[0:3]
+		),
+		"\n  Kalman pose correction position [m] =",
+		delta_x[3:6],
+		"\n  Kalman velocity correction [m/s] =",
+		delta_x[7:10],
+	)
+
 	return (
-		quaternion_wb,
-		position_wb,
-		state
+		corrected_state
+		.quaternion_wb.copy(),
+		corrected_state
+		.position_wb.copy(),
+		corrected_state,
+		True,
 	)

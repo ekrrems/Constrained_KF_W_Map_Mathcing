@@ -80,6 +80,43 @@ def rotation_vector_to_quaternion(
 		)
 	)
 
+def rotation_matrix_to_quaternion(
+	R: np.ndarray,
+) -> np.ndarray:
+
+	trace = np.trace(R)
+
+	if trace > 0:
+		s = np.sqrt(trace + 1.0) * 2
+
+		w = 0.25 * s
+		x = (
+			R[2,1] - R[1,2]
+		) / s
+		y = (
+			R[0,2] - R[2,0]
+		) / s
+		z = (
+			R[1,0] - R[0,1]
+		) / s
+
+	else:
+		raise NotImplementedError(
+			"Implement full branch"
+		)
+
+	return normalize_quaternion(
+		np.array(
+			[
+				w,
+				x,
+				y,
+				z,
+			],
+			dtype=np.float64,
+		)
+	)
+
 
 def quaternion_to_rotation_matrix(
 	quaternion: np.ndarray,
@@ -109,4 +146,42 @@ def quaternion_to_rotation_matrix(
 			],
 		],
 		dtype=np.float64,
+	)
+
+def rotation_x(angle):
+	c=np.cos(angle)
+	s=np.sin(angle)
+
+	return np.array(
+		[
+			[1,0,0],
+			[0,c,-s],
+			[0,s,c]
+		]
+	)
+
+
+def rotation_y(angle):
+	c=np.cos(angle)
+	s=np.sin(angle)
+
+	return np.array(
+		[
+			[c,0,s],
+			[0,1,0],
+			[-s,0,c]
+		]
+	)
+
+
+def rotation_z(angle):
+	c=np.cos(angle)
+	s=np.sin(angle)
+
+	return np.array(
+		[
+			[c,-s,0],
+			[s,c,0],
+			[0,0,1]
+		]
 	)

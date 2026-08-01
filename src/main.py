@@ -3,6 +3,8 @@
 """
 
 from pathlib import Path
+import matplotlib.pyplot as plt
+
 
 import numpy as np
 import cv2
@@ -92,8 +94,16 @@ def main() -> None:
 	lidar_quaternions_wb: list[np.ndarray] = []
 
 
+	sync_sequence_path = Path(
+	"/Users/ekremserdarozturk/Desktop/Projects/"
+	"Datasets/KITTI_RAW/2011_10_03/"
+	"2011_10_03_drive_0027_sync"
+)
+
 	sensor_handler = SensorHandler(
-		SEQUENCE_PATH
+		sync_sequence_path=sync_sequence_path,
+		extract_sequence_path=None,
+		frame_step=1,
 	)
 
 	# visualization
@@ -152,8 +162,18 @@ def main() -> None:
 	)
 
 	# initialize state estimator
-	esikf = ESIKF(SEQUENCE_PATH,np.array([first_latitude, first_longitude]), oxts_heading)
+	# esikf = ESIKF(SEQUENCE_PATH,np.array([first_latitude, first_longitude]), oxts_heading)
 
+	initial_packet = (
+		sensor_handler
+		.get_initial_oxts_packet()
+	)
+
+	esikf = ESIKF(
+		SEQUENCE_PATH,
+		np.array([first_latitude, first_longitude]),
+		initial_packet,
+	)
 	# Test the new visualization section #
 	map_window = LiveMapWindow(
 		roads_metric=roads_metric
@@ -196,6 +216,98 @@ def main() -> None:
 		),
 	)
 
+	# Initialize with IMU input
+	imu_initialized = False
+
+	plt.ion()
+
+	imu_figure, (
+		accel_axis,
+		gyro_axis,
+	) = plt.subplots(
+		2,
+		1,
+		figsize=(10, 7),
+	)
+
+	accel_x_line, = accel_axis.plot([], [], label="ax")
+	accel_y_line, = accel_axis.plot([], [], label="ay")
+	accel_z_line, = accel_axis.plot([], [], label="az")
+
+	accel_axis.set_title("IMU acceleration input")
+	accel_axis.set_ylabel("m/s²")
+	accel_axis.grid(True)
+	accel_axis.legend()
+
+	gyro_x_line, = gyro_axis.plot([], [], label="wx")
+	gyro_y_line, = gyro_axis.plot([], [], label="wy")
+	gyro_z_line, = gyro_axis.plot([], [], label="wz")
+
+	gyro_axis.set_title("IMU gyro input")
+	gyro_axis.set_xlabel("Time [s]")
+	gyro_axis.set_ylabel("rad/s")
+	gyro_axis.grid(True)
+	gyro_axis.legend()
+
+	imu_figure.tight_layout()
+	imu_figure.show()
+
+	last_imu_timestamp = None
+
+	frame_count = min(
+		len(sensor_handler.imu_measurements),
+		len(sensor_handler.lidar_measurements),
+	)
+
+	# for frame_index in range(frame_count):
+	# 	imu_measurement = (
+	# 		sensor_handler.imu_measurements[
+	# 			frame_index
+	# 		]
+	# 	)
+
+	# 	lidar_measurement = (
+	# 		sensor_handler.lidar_measurements[
+	# 			frame_index
+	# 		]
+	# 	)
+
+	# 	esikf.propagateImu(
+	# 		imu_measurement
+	# 	)
+
+	# 	lidar_result = (
+	# 		esikf.lidar_measurement_update(
+	# 			lidar_measurement
+	# 		)
+	# 	)
+
+	# imu_measurements = sensor_handler.imu_measurements
+	# lidar_measurements = sensor_handler.lidar_measurements
+	# image_measurements = sensor_handler.image_measurements
+
+	# frame_count = min(
+	# 	len(imu_measurements),
+	# 	len(lidar_measurements),
+	# 	len(image_measurements),
+	# )
+
+	# for index in range(min(frame_count, 30)):
+	# 	imu_time = imu_measurements[index].timestamp
+	# 	lidar_time = lidar_measurements[index].timestamp
+	# 	image_time = image_measurements[index].timestamp
+
+	# 	print(
+	# 		index,
+	# 		"LiDAR-image [ms]:",
+	# 		1000.0 * (lidar_time - image_time),
+	# 		"IMU-image [ms]:",
+	# 		1000.0 * (imu_time - image_time),
+	# 		"LiDAR-IMU [ms]:",
+	# 		1000.0 * (lidar_time - imu_time),
+	# 	)
+	# raise ValueError("stop")
+
 	try:
 		for measurement in sensor_handler:
 			# IMU propagation
@@ -203,34 +315,150 @@ def main() -> None:
 				measurement,
 				ImuMeasurement,
 			):
-				pass
-				# esikf.propagateImu(
-				# 	measurement
-				# )
+				last_imu_timestamp = measurement.timestamp
+
+				esikf.propagateImu(
+					measurement
+				)
+
+				if len(esikf.debug_imu_timestamps) > 0:
+					imu_initialized = True
+
+					imu_times = np.asarray(
+						esikf.debug_imu_timestamps,
+						dtype=np.float64,
+					)
+
+					accelerations = np.asarray(
+						esikf.debug_accelerations_b,
+						dtype=np.float64,
+					)
+
+					gyros = np.asarray(
+						esikf.debug_gyros_b,
+						dtype=np.float64,
+					)
+
+					relative_time = (
+						imu_times - imu_times[0]
+					)
+
+					# Only plot the latest 300 samples
+					start = max(
+						0,
+						len(relative_time) - 300,
+					)
+
+					plot_time = relative_time[start:]
+					plot_acceleration = accelerations[start:]
+					plot_gyro = gyros[start:]
+
+					accel_x_line.set_data(
+						plot_time,
+						plot_acceleration[:, 0],
+					)
+
+					accel_y_line.set_data(
+						plot_time,
+						plot_acceleration[:, 1],
+					)
+
+					accel_z_line.set_data(
+						plot_time,
+						plot_acceleration[:, 2],
+					)
+
+					gyro_x_line.set_data(
+						plot_time,
+						plot_gyro[:, 0],
+					)
+
+					gyro_y_line.set_data(
+						plot_time,
+						plot_gyro[:, 1],
+					)
+
+					gyro_z_line.set_data(
+						plot_time,
+						plot_gyro[:, 2],
+					)
+
+					accel_axis.relim()
+					accel_axis.autoscale_view()
+
+					gyro_axis.relim()
+					gyro_axis.autoscale_view()
+
+					imu_figure.canvas.draw_idle()
+					imu_figure.canvas.flush_events()
+
+					plt.pause(0.001)
+
+
 
 			# measurement update
 			elif isinstance(
 				measurement,
 				LidarMeasurement,
 			):
+
+				if last_imu_timestamp is not None:
+					dt_sensor_ms = 1000.0 * (
+						measurement.timestamp
+						- last_imu_timestamp
+					)
+
+					print(
+						"LiDAR - latest IMU [ms]:",
+						dt_sensor_ms,
+					)
+				if not imu_initialized:
+					continue
+
 				lidar_result = (
 					esikf.lidar_measurement_update(
 						measurement
 					)
 				)
 
+				yaw = esikf.quaternion_to_yaw_rad(
+					esikf.state.quaternion_wb
+				)
+
+				velocity_heading = np.arctan2(
+					esikf.state.velocity_wb[1],
+					esikf.state.velocity_wb[0],
+				)
+
+				heading_difference = np.arctan2(
+					np.sin(velocity_heading - yaw),
+					np.cos(velocity_heading - yaw),
+				)
+
+				print(
+					"Pose yaw:",
+					np.rad2deg(yaw),
+					"Velocity heading:",
+					np.rad2deg(velocity_heading),
+					"Difference:",
+					np.rad2deg(heading_difference),
+				)
+
 				if lidar_result is None:
 					continue
 
 				predicted_position = (
+					# esikf.state.position_wb
 					lidar_result.predicted_position_wb
 				)
 
 				corrected_position = (
+					# esikf.state.position_wb
 					lidar_result.corrected_position_wb
 				)
 
 				corrected_quaternion = (
+					# esikf.state.quaternion_wb
 					lidar_result.corrected_quaternion_wb
 				)
 
@@ -319,97 +547,6 @@ def main() -> None:
 					)
 				)
 
-				# road_tangent_xy = np.array(
-				# 	[
-				# 		np.cos(matched_heading_rad),
-				# 		np.sin(matched_heading_rad),
-				# 	],
-				# 	dtype=np.float64,
-				# )
-
-				# Update the measurement using the map mathcing algo
-				"@@@@@@@@@@@@"
-				# road_normal_xy = np.array(
-				# 	[
-				# 		-road_tangent_xy[1],
-				# 		road_tangent_xy[0],
-				# 	],
-				# 	dtype=np.float64,
-				# )
-
-				# position_before = (
-				# 	esikf.state.position_wb[:2].copy()
-				# )
-
-				# residual_before = float(
-				# 	road_normal_xy
-				# 	@ (
-				# 		projection.closest_point_xy
-				# 		- position_before
-				# 	)
-				# )
-
-				# position_covariance_xy = (
-				# 	esikf.state.covariance[3:5, 3:5]
-				# )
-
-				# lateral_variance = float(
-				# 	road_normal_xy
-				# 	@ position_covariance_xy
-				# 	@ road_normal_xy
-				# )
-
-				# measurement_variance = 0.1**2
-
-				# expected_gain = (
-				# 	lateral_variance
-				# 	/ (
-				# 		lateral_variance
-				# 		+ measurement_variance
-				# 	)
-				# )
-
-				# print("Position covariance:\n", position_covariance_xy)
-				# print("Lateral variance:", lateral_variance)
-				# print("Map variance:", measurement_variance)
-				# print("Expected lateral gain:", expected_gain)
-				# print("Residual before:", residual_before)
-
-				# esikf.road_map_measurement_update(
-				# 	matched_position_xy=(
-				# 		projection.closest_point_xy
-				# 	),
-				# 	road_tangent_xy=road_tangent_xy,
-				# 	measurement_std_m=0.01,
-				# )
-
-				# position_after = (
-				# 	esikf.state.position_wb[:2].copy()
-				# )
-
-				# residual_after = float(
-				# 	road_normal_xy
-				# 	@ (
-				# 		projection.closest_point_xy
-				# 		- position_after
-				# 	)
-				# )
-
-				# print("Position before:", position_before)
-				# print("Position after:", position_after)
-				# print("Projection:", projection.closest_point_xy)
-				# print("Residual after:", residual_after)
-				# "@@@@@@@@@@@@@@"
-				# esikf.road_map_measurement_update(
-				# 	matched_position_xy=(
-				# 		projection.closest_point_xy
-				# 	),
-				# 	road_tangent_xy=(
-				# 		road_tangent_xy
-				# 	),
-				# 	measurement_std_m=0.1,
-				# )
-
 				general_mm_pose.update(
 					position_xy_utm=(
 						projection
@@ -447,7 +584,7 @@ def main() -> None:
 					candidate_positions_xy=(
 						candidate_positions_xy
 					),
-					follow_radius_m=40.0,
+					follow_radius_m=70.0,
 				)
 
 				print(
@@ -455,21 +592,21 @@ def main() -> None:
 					corrected_position,
 				)
 
-				print(
-					"Map minimum:",
-					np.min(
-						display_points_w,
-						axis=0,
-					),
-				)
+				# print(
+				# 	"Map minimum:",
+				# 	np.min(
+				# 		display_points_w,
+				# 		axis=0,
+				# 	),
+				# )
 
-				print(
-					"Map maximum:",
-					np.max(
-						display_points_w,
-						axis=0,
-					),
-				)
+				# print(
+				# 	"Map maximum:",
+				# 	np.max(
+				# 		display_points_w,
+				# 		axis=0,
+				# 	),
+				# )
 
 				print(
 					"Map dtype:",
