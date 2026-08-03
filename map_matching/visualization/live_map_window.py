@@ -6,6 +6,7 @@ from collections import deque
 
 from shapely.geometry import LineString, MultiLineString
 import matplotlib.pyplot as plt
+import contextily as ctx
 
 from map_matching.visualization.pose_layer import PoseLayer
 from map_matching.algorithms.general_mm_algo import RoadLink
@@ -14,7 +15,9 @@ from map_matching.algorithms.general_mm_algo import RoadLink
 class LiveMapWindow:
 	def __init__(
 			self,
-			roads_metric
+			roads_metric,
+			show_basemap: bool = True,
+        	basemap_padding_m: float = 100.0,
 	) -> None:
 		print("############################################ Live map initialized")
 		plt.ion()
@@ -24,6 +27,26 @@ class LiveMapWindow:
 			self.axis,
 		) = plt.subplots(
 			figsize=(12, 10)
+		)
+
+		if roads_metric.crs is None:
+			raise ValueError(
+				"roads_metric must have a CRS."
+			)
+
+		self.map_crs = (
+			roads_metric.crs
+		)
+
+		minimum_x, minimum_y, maximum_x, maximum_y = (
+			roads_metric.total_bounds
+		)
+
+		self.basemap_bounds = (
+			minimum_x - basemap_padding_m,
+			minimum_y - basemap_padding_m,
+			maximum_x + basemap_padding_m,
+			maximum_y + basemap_padding_m,
 		)
 
 		self.recent_lidar_positions = deque(
@@ -88,6 +111,46 @@ class LiveMapWindow:
 				zorder=31,
 			)
 		)
+
+		(
+			basemap_minimum_x,
+			basemap_minimum_y,
+			basemap_maximum_x,
+			basemap_maximum_y,
+		) = self.basemap_bounds
+
+		# Set the requested tile extent before
+		# downloading the basemap.
+		self.axis.set_xlim(
+			basemap_minimum_x,
+			basemap_maximum_x,
+		)
+
+		self.axis.set_ylim(
+			basemap_minimum_y,
+			basemap_maximum_y,
+		)
+
+		if show_basemap:
+			try:
+				ctx.add_basemap(
+					self.axis,
+					crs=self.map_crs.to_string(),
+					source=(
+						ctx.providers
+						.OpenStreetMap
+						.Mapnik
+					),
+					reset_extent=True,
+					attribution=True,
+					zorder=0,
+				)
+
+			except Exception as error:
+				print(
+					"Could not load OSM basemap:",
+					error,
+				)
 
 		# Draw roads
 		roads_metric.plot(

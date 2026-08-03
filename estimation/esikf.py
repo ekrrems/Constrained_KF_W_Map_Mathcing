@@ -950,3 +950,213 @@ class ESIKF:
 		self.state.gravity_w += 0.0
 
 
+	def map_heading_measurement_update(
+		self,
+		map_heading_rad: float,
+		measurement_variance: float,
+		nis_threshold: float = 6.63,
+	) -> tuple[bool, float]:
+		predicted_heading_rad = (
+			self.quaternion_to_yaw_rad(
+				self.state.quaternion_wb
+			)
+		)
+
+		innovation = self.wrap_angle_rad(
+			map_heading_rad
+			- predicted_heading_rad
+		)
+
+		covariance_prior = (
+			self.state.covariance
+		)
+
+		state_dimension = (
+			covariance_prior.shape[0]
+		)
+
+		state_jacobian = np.zeros(
+			(1, state_dimension),
+			dtype=np.float64,
+		)
+
+		# Initial approximation:
+		# error_state[0:3] =
+		# [delta_roll, delta_pitch, delta_yaw]
+		state_jacobian[0, 2] = 1.0
+
+		measurement_covariance = np.array(
+			[[measurement_variance]],
+			dtype=np.float64,
+		)
+
+		innovation_covariance = (
+			state_jacobian
+			@ covariance_prior
+			@ state_jacobian.T
+			+ measurement_covariance
+		)
+
+		innovation_variance = float(
+			innovation_covariance[0, 0]
+		)
+
+		if innovation_variance <= 0.0:
+			raise ValueError(
+				"Invalid map-heading innovation variance."
+			)
+
+		nis = (
+			innovation**2
+			/ innovation_variance
+		)
+
+		print(
+			"Road heading [deg]:",
+			np.rad2deg(map_heading_rad),
+			"ESIKF heading [deg]:",
+			np.rad2deg(predicted_heading_rad),
+			"residual [deg]:",
+			np.rad2deg(innovation),
+			"NIS:",
+			nis,
+		)
+
+		if nis > nis_threshold:
+			return (False, float(nis))
+
+		kalman_gain = (
+			covariance_prior
+			@ state_jacobian.T
+			@ np.linalg.inv(
+				innovation_covariance
+			)
+		)
+
+		delta_state = (
+			kalman_gain[:, 0]
+			* innovation
+		)
+
+		identity = np.eye(
+			state_dimension,
+			dtype=np.float64,
+		)
+
+		correction_matrix = (
+			identity
+			- kalman_gain
+			@ state_jacobian
+		)
+
+		covariance_posterior = (
+			correction_matrix
+			@ covariance_prior
+			@ correction_matrix.T
+			+ kalman_gain
+			@ measurement_covariance
+			@ kalman_gain.T
+		)
+
+		print(
+			"Map heading sigma [deg]:",
+			np.rad2deg(
+				np.sqrt(
+					measurement_variance
+				)
+			),
+		)
+
+		print(
+			"Map Kalman gain yaw:",
+			float(
+				kalman_gain[2, 0]
+			),
+		)
+
+		print(
+			"Map delta rotation [deg]:",
+			np.rad2deg(
+				delta_state[0:3]
+			),
+		)
+
+		print(
+			"Map delta position [m]:",
+			delta_state[3:6],
+		)
+
+		print(
+			"Map delta velocity [m/s]:",
+			delta_state[7:10],
+		)
+
+		print(
+			"Map delta gyro bias:",
+			delta_state[10:13],
+		)
+
+		print(
+			"Map delta accel bias:",
+			delta_state[13:16],
+		)
+
+		print(
+			"Map delta gravity:",
+			delta_state[16:19],
+		)
+
+		self.inject_error_state(
+			delta_state
+		)
+
+		self.state.covariance = (
+			covariance_posterior
+		)
+
+		return (True, float(nis))
+
+
+
+
+	@staticmethod
+	def wrap_angle_rad(
+		angle_rad: float,
+	) -> float:
+		return float(
+			np.arctan2(
+				np.sin(angle_rad),
+				np.cos(angle_rad),
+			)
+		)
+
+	@staticmethod
+	def calculate_map_heading_std_rad(
+		speed_mps: float,
+		minimum_std_rad: float = np.deg2rad(3.0),
+		reference_speed_mps: float = 20.0,
+	) -> float:
+		if reference_speed_mps <= 0.0:
+			raise ValueError(
+				"reference_speed_mps must be positive."
+			)
+
+		speed_ratio = np.clip(
+			abs(speed_mps)
+			/ reference_speed_mps,
+			0.0,
+			1.0,
+		)
+
+		heading_std_rad = (
+			(1.0 - speed_ratio)
+			* (np.pi / 2.0)
+			+ speed_ratio
+			* minimum_std_rad
+		)
+
+		return float(
+			heading_std_rad
+		)
+
+
