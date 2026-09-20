@@ -38,6 +38,8 @@ SEQUENCE_PATH = Path(
 	"/Users/ekremserdarozturk/Desktop/Projects/Datasets/KITTI_RAW/"
 	"2011_10_03/2011_10_03_drive_0027_sync"
 )
+EXTRACT_SEQUENCE_PATH = Path("/Users/ekremserdarozturk/Desktop/Projects/Datasets/KITTI_RAW/2011_10_03/2011_10_03_drive_0027_extract")
+
 OSM_PATH = Path("outputs/osm_roads.geojson")
 OUTPUT_DIRECTORY = Path("outputs/trajectories")
 VALID_MODES = ("imu_only", "lidar", "one_step_heading", "two_step")
@@ -275,7 +277,7 @@ def create_esikf_and_map():
 
 	sensor_handler = SensorHandler(
 		sync_sequence_path=SEQUENCE_PATH,
-		extract_sequence_path=None,
+		extract_sequence_path=EXTRACT_SEQUENCE_PATH,
 		frame_step=1,
 	)
 	latitude, longitude = read_first_oxts_lat_lon(SEQUENCE_PATH)
@@ -311,15 +313,15 @@ def main() -> None:
 		map_window, pose_layers = create_live_map(roads_metric)
 
 	lidar_viewer = None
-	if not args.no_lidar_viewer and mode != "imu_only":
-		lidar_viewer = LidarViewer(
-			window_name="LiDAR local map",
-			width=1280,
-			height=800,
-			point_size=2.0,
-			follow_vehicle=True,
-			initial_zoom=0.05,
-		)
+	# if not args.no_lidar_viewer and mode != "imu_only":
+	# 	lidar_viewer = LidarViewer(
+	# 		window_name="LiDAR local map",
+	# 		width=1280,
+	# 		height=800,
+	# 		point_size=2.0,
+	# 		follow_vehicle=True,
+	# 		initial_zoom=0.05,
+	# 	)
 
 	trajectory = TrajectoryLog()
 	imu_initialized = False
@@ -332,10 +334,10 @@ def main() -> None:
 				continue
 
 			if isinstance(measurement, ImageMeasurement):
-				if args.show_images:
-					cv2.imshow("combinedImage", combineImages(measurement))
-					cv2.waitKey(1)
-				continue
+
+				cv2.imshow("combinedImage", combineImages(measurement))
+				cv2.waitKey(1)
+
 
 			if not isinstance(measurement, LidarMeasurement) or not imu_initialized:
 				continue
@@ -450,34 +452,34 @@ def main() -> None:
 						follow_radius_m=30.0,
 					)
 
-			if lidar_viewer is not None:
-				# One-step affects the filter. Two-step is only an external output.
-				viewer_position = (
-					esikf.state.position_wb
-					if mode == "one_step_heading"
-					else lidar_position
-				)
-				viewer_quaternion = (
-					esikf.state.quaternion_wb
-					if mode == "one_step_heading"
-					else lidar_quaternion
-				)
-				viewer_running = lidar_viewer.update(
-					points_w=esikf.local_map.points_w,
-					imu_position_w=imu_position,
-					corrected_position_w=viewer_position,
-					corrected_quaternion_wb=viewer_quaternion,
-				)
-				if not viewer_running:
-					break
+			# if lidar_viewer is not None:
+			# 	# One-step affects the filter. Two-step is only an external output.
+			# 	viewer_position = (
+			# 		esikf.state.position_wb
+			# 		if mode == "one_step_heading"
+			# 		else lidar_position
+			# 	)
+			# 	viewer_quaternion = (
+			# 		esikf.state.quaternion_wb
+			# 		if mode == "one_step_heading"
+			# 		else lidar_quaternion
+			# 	)
+			# 	viewer_running = lidar_viewer.update(
+			# 		points_w=esikf.local_map.points_w,
+			# 		imu_position_w=imu_position,
+			# 		corrected_position_w=viewer_position,
+			# 		corrected_quaternion_wb=viewer_quaternion,
+			# 	)
+			# 	if not viewer_running:
+			# 		break
 
 	finally:
 		if trajectory.positions_w:
 			# output_path = trajectory.save(mode)
 			# print(f"Saved {mode} trajectory to {output_path}")
 			...
-		if lidar_viewer is not None:
-			lidar_viewer.close()
+		# if lidar_viewer is not None:
+		# 	lidar_viewer.close()
 		if map_window is not None:
 			map_window.close()
 		cv2.destroyAllWindows()
