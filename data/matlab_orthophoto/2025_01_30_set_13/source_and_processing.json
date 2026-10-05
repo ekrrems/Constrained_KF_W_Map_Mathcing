@@ -1,0 +1,27 @@
+{
+  "source": "LGL Baden-Wuerttemberg DOP20 RGB WMS",
+  "service": "https://owsproxy.lgl-bw.de/owsproxy/ows/WMS_LGL-BW_ATKIS_DOP_20_C",
+  "layer": "IMAGES_DOP_20_RGB",
+  "request_urls": [
+    "https://owsproxy.lgl-bw.de/owsproxy/ows/WMS_LGL-BW_ATKIS_DOP_20_C?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=IMAGES_DOP_20_RGB&STYLES=&SRS=EPSG%3A25832&BBOX=524941.500%2C5383621.500%2C527830.500%2C5386693.500&WIDTH=1926&HEIGHT=2048&FORMAT=image%2Fjpeg",
+    "https://owsproxy.lgl-bw.de/owsproxy/ows/WMS_LGL-BW_ATKIS_DOP_20_C?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=IMAGES_DOP_20_RGB&STYLES=&SRS=EPSG%3A25832&BBOX=524941.500%2C5380549.500%2C527830.500%2C5383621.500&WIDTH=1926&HEIGHT=2048&FORMAT=image%2Fjpeg",
+    "https://owsproxy.lgl-bw.de/owsproxy/ows/WMS_LGL-BW_ATKIS_DOP_20_C?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=IMAGES_DOP_20_RGB&STYLES=&SRS=EPSG%3A25832&BBOX=524941.500%2C5378280.000%2C527830.500%2C5380549.500&WIDTH=1926&HEIGHT=1513&FORMAT=image%2Fjpeg"
+  ],
+  "license": "Datenlizenz Deutschland - Namensnennung - Version 2.0",
+  "attribution": "Landesamt fuer Geoinformation und Landentwicklung Baden-Wuerttemberg (LGL)",
+  "raster_crs": "EPSG:25832",
+  "map_source": "/Users/ekremserdarozturk/Desktop/University_of_Stuttgart/Masters_Thesis/Data/EKF_V4_1/Data/track.db",
+  "map_source_crs": "EPSG:32632",
+  "bbox": [
+    524941.5,
+    5378280.0,
+    527830.5,
+    5386693.5
+  ],
+  "resolution_m_per_pixel": 1.5,
+  "width": 1926,
+  "height": 5609,
+  "mask_method": "OSM-seeded orthophoto colour/texture road-area extraction",
+  "important_limitation": "The mask is not independent of OSM: OSM limits the search corridor; orthophoto appearance determines the road-area pixels.",
+  "reference_trajectory_used": false
+}
