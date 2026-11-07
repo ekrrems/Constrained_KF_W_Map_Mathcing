@@ -25,11 +25,7 @@ from src.map_matlab_main import (
 from visualization.map_result_visualizer import plot_mode_comparison
 
 
-# Orthophoto modes require an independent image-registration provider. They
-# are intentionally excluded until real orthophoto observations are supplied.
-MODES_TO_COMPARE = tuple(
-    mode for mode in VALID_MODES if "orthophoto" not in mode
-)
+MODES_TO_COMPARE = VALID_MODES
 REFERENCE_COVERAGE_MAX_DISTANCE_M = 20.0
 
 
@@ -91,9 +87,13 @@ def write_epoch_csv(
                 f"{mode}_map_nis",
                 f"{mode}_map_accepted",
                 f"{mode}_association_valid",
-                f"{mode}_orthophoto_nis",
-                f"{mode}_orthophoto_accepted",
-                f"{mode}_orthophoto_observation_valid",
+                f"{mode}_association_ambiguous",
+                f"{mode}_hypothesis_count",
+                f"{mode}_association_best_probability",
+                f"{mode}_association_effective_hypotheses",
+                f"{mode}_association_entropy",
+                f"{mode}_selected_way_id",
+                f"{mode}_gnss_velocity_used",
             ]
         )
 
@@ -127,9 +127,13 @@ def write_epoch_csv(
                         float(result["map_nis"][index]),
                         int(result["map_accepted"][index]),
                         int(result["association_valid"][index]),
-                        float(result["orthophoto_nis"][index]),
-                        int(result["orthophoto_accepted"][index]),
-                        int(result["orthophoto_observation_valid"][index]),
+                        int(result["association_ambiguous"][index]),
+                        int(result["hypothesis_count"][index]),
+                        float(result["association_best_probability"][index]),
+                        float(result["association_effective_hypotheses"][index]),
+                        float(result["association_entropy"][index]),
+                        int(result["selected_way_id"][index]),
+                        int(result["gnss_velocity_used"][index]),
                     ]
                 )
             writer.writerow(row)
@@ -141,7 +145,7 @@ def main() -> None:
         recording_date=RECORDING_DATE,
         record_set=RECORD_SET,
         apply_supplied_bias=True,
-        apply_axis_orientation=False,
+        apply_axis_orientation=True,
     )
     matcher = TrackDatabaseMatcher(find_unique(DATA_FOLDER, "track.db"))
     reference = ReferencePolyline(

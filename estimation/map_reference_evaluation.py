@@ -32,6 +32,43 @@ class DistanceStatistics:
         )
 
 
+@dataclass(frozen=True)
+class SignedDistanceStatistics:
+    """Perpendicular-error statistics relative to the reference direction.
+
+    Positive signed distances lie to the left of the oriented reference
+    polyline and negative values lie to its right.  The sign is meaningful
+    only when the reference point order is documented and kept fixed.
+    """
+
+    count: int
+    mean_m: float
+    median_m: float
+    rmse_m: float
+    percentile_95_m: float
+    maximum_m: float
+    signed_bias_m: float
+
+    @classmethod
+    def from_signed_distances(
+        cls, signed_distances_m: np.ndarray
+    ) -> "SignedDistanceStatistics":
+        signed = np.asarray(signed_distances_m, dtype=np.float64).reshape(-1)
+        signed = signed[np.isfinite(signed)]
+        if signed.size == 0:
+            return cls(0, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan)
+        absolute = np.abs(signed)
+        return cls(
+            count=int(signed.size),
+            mean_m=float(np.mean(absolute)),
+            median_m=float(np.median(absolute)),
+            rmse_m=float(np.sqrt(np.mean(signed**2))),
+            percentile_95_m=float(np.percentile(absolute, 95.0)),
+            maximum_m=float(np.max(absolute)),
+            signed_bias_m=float(np.mean(signed)),
+        )
+
+
 class ReferencePolyline:
     """Piecewise-linear reference trajectory in projected UTM coordinates."""
 
@@ -64,6 +101,71 @@ class ReferencePolyline:
         best = int(np.argmin(distances_squared))
         return projections[best].copy(), float(np.sqrt(distances_squared[best]))
 
+    def closest_point_and_signed_distance(
+        self, position_xy: np.ndarray
+    ) -> tuple[np.ndarray, float]:
+        """Return projection and oriented perpendicular distance.
+
+        The local left normal of the closest reference segment defines the
+        positive direction.  Endpoint projections use the same segment
+        orientation as their adjacent reference segment.
+        """
+        position = np.asarray(position_xy, dtype=np.float64).reshape(2)
+        relative = position - self.segment_starts
+        fractions = np.einsum("ij,ij->i", relative, self.segment_vectors)
+        fractions /= self.segment_lengths_squared
+        fractions = np.clip(fractions, 0.0, 1.0)
+        projections = self.segment_starts + fractions[:, None] * self.segment_vectors
+        residuals = position - projections
+        distances_squared = np.einsum("ij,ij->i", residuals, residuals)
+        best = int(np.argmin(distances_squared))
+        tangent = self.segment_vectors[best] / np.sqrt(
+            self.segment_lengths_squared[best]
+        )
+        left_normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+        # Keep the complete point-to-segment distance as the magnitude.  The
+        # normal component alone silently loses along-track error when the
+        # closest point is a segment endpoint.  It is used only for the
+        # left/right sign.
+        distance = float(np.sqrt(distances_squared[best]))
+        normal_component = float(left_normal @ residuals[best])
+        signed_distance = float(np.copysign(distance, normal_component))
+        return projections[best].copy(), signed_distance
+
+    def is_within_longitudinal_coverage(
+        self, position_xy: np.ndarray, *, tolerance_m: float = 1.0e-6
+    ) -> bool:
+        """Return false for extrapolation beyond a global reference endpoint.
+
+        A point may be close to the first or last reference node but outside
+        the digitized route.  A distance-only mask would then evaluate an area
+        where no reference exists.  Interior vertices remain valid; this test
+        rejects only positions before the first node or after the last node.
+        """
+        if tolerance_m < 0.0:
+            raise ValueError("tolerance_m must be non-negative")
+        position = np.asarray(position_xy, dtype=np.float64).reshape(2)
+        relative = position - self.segment_starts
+        unbounded_fractions = (
+            np.einsum("ij,ij->i", relative, self.segment_vectors)
+            / self.segment_lengths_squared
+        )
+        fractions = np.clip(unbounded_fractions, 0.0, 1.0)
+        projections = self.segment_starts + fractions[:, None] * self.segment_vectors
+        residuals = position - projections
+        distances_squared = np.einsum("ij,ij->i", residuals, residuals)
+        best = int(np.argmin(distances_squared))
+        segment_length = float(np.sqrt(self.segment_lengths_squared[best]))
+        fraction_tolerance = tolerance_m / segment_length
+        if best == 0 and unbounded_fractions[best] < -fraction_tolerance:
+            return False
+        if (
+            best == len(self.segment_starts) - 1
+            and unbounded_fractions[best] > 1.0 + fraction_tolerance
+        ):
+            return False
+        return True
+
     def distance(self, position_xy: np.ndarray) -> float:
         return self.closest_point_and_distance(position_xy)[1]
 
@@ -75,8 +177,26 @@ class ReferencePolyline:
             count=len(positions),
         )
 
+    def signed_distances(self, positions_xy: np.ndarray) -> np.ndarray:
+        positions = np.asarray(positions_xy, dtype=np.float64).reshape(-1, 2)
+        return np.fromiter(
+            (
+                self.closest_point_and_signed_distance(position)[1]
+                for position in positions
+            ),
+            dtype=np.float64,
+            count=len(positions),
+        )
+
     def statistics(self, positions_xy: np.ndarray) -> DistanceStatistics:
         return DistanceStatistics.from_distances(self.distances(positions_xy))
+
+    def signed_statistics(
+        self, positions_xy: np.ndarray
+    ) -> SignedDistanceStatistics:
+        return SignedDistanceStatistics.from_signed_distances(
+            self.signed_distances(positions_xy)
+        )
 
     def coverage_mask(
         self,
@@ -92,4 +212,50 @@ class ReferencePolyline:
         """
         if maximum_distance_m <= 0.0:
             raise ValueError("maximum_distance_m must be positive")
-        return self.distances(reference_probe_positions_xy) <= maximum_distance_m
+        probes = np.asarray(
+            reference_probe_positions_xy, dtype=np.float64
+        ).reshape(-1, 2)
+        close_enough = self.distances(probes) <= maximum_distance_m
+        longitudinally_covered = np.fromiter(
+            (self.is_within_longitudinal_coverage(point) for point in probes),
+            dtype=bool,
+            count=len(probes),
+        )
+        return close_enough & longitudinally_covered
+
+
+def block_bootstrap_rmse_interval(
+    errors_m: np.ndarray,
+    *,
+    block_length: int = 20,
+    repetitions: int = 2000,
+    confidence: float = 0.95,
+    seed: int = 20261107,
+) -> tuple[float, float]:
+    """Moving-block bootstrap interval for RMSE of correlated epochs."""
+    values = np.asarray(errors_m, dtype=np.float64).reshape(-1)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return np.nan, np.nan
+    if block_length < 1 or block_length > values.size:
+        raise ValueError("block_length must be between 1 and the sample count")
+    if repetitions < 100:
+        raise ValueError("repetitions must be at least 100")
+    if not 0.0 < confidence < 1.0:
+        raise ValueError("confidence must lie between zero and one")
+
+    rng = np.random.default_rng(seed)
+    start_count = values.size - block_length + 1
+    block_count = int(np.ceil(values.size / block_length))
+    estimates = np.empty(repetitions, dtype=np.float64)
+    for index in range(repetitions):
+        starts = rng.integers(0, start_count, size=block_count)
+        sample = np.concatenate(
+            [values[start : start + block_length] for start in starts]
+        )[: values.size]
+        estimates[index] = np.sqrt(np.mean(sample**2))
+    tail = 0.5 * (1.0 - confidence)
+    return (
+        float(np.quantile(estimates, tail)),
+        float(np.quantile(estimates, 1.0 - tail)),
+    )

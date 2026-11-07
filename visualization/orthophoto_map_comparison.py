@@ -162,7 +162,9 @@ def plot_orthophoto_map_comparison(
     input_axis.plot(
         raw_xy[:, 0], raw_xy[:, 1],
         color="#d81b60", linewidth=1.5, alpha=0.95,
-        linestyle=(0, (5, 3)), label="Raw/available GNSS", zorder=5,
+        linestyle=(0, (5, 3)),
+        label="Recorded GNSS positions (unfiltered)",
+        zorder=5,
     )
     input_axis.plot(
         reference_xy[:, 0], reference_xy[:, 1],

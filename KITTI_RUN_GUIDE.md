@@ -1,108 +1,102 @@
-# Running the IMU–GNSS and map-constrained ESIKF on KITTI
+# KITTI urban robustness experiment
 
-## Data and storage
+KITTI is a secondary stress-test, not a replacement for the Intermetric railway
+experiment. It asks whether a direct map constraint can limit horizontal drift
+when GNSS updates are sparse or withheld in an urban road network.
 
-The project does not download or duplicate KITTI. Use the existing drive:
+The comparison uses the same five methods as the railway run: GNSS/IMU ESKF,
+two-step output projection, map heading, cross-track position, and the combined
+cross-track and heading observation. IMU-only propagation is excluded.
+Orthophoto constraints remain deferred until an independent and manually
+validated digitization is available.
+
+## Required data
+
+The runner expects KITTI odometry sequence 00 and its corresponding raw drive,
+`2011_10_03_drive_0027_sync`. For the estimator propagation, use the associated
+`2011_10_03_drive_0027_extract` folder as the IMU source. The extract OXTS
+packets retain the approximately 100 Hz inertial stream, while the sync drive
+keeps GNSS, map-update, and sequence-00 evaluation epochs aligned at
+approximately 10 Hz.
+
+Restore the drive under, for example:
 
 ```text
 /Users/ekremserdarozturk/Desktop/Projects/Datasets/KITTI_RAW/2011_10_03
 ```
 
-The active experiments need OXTS only. Camera and Velodyne folders are not
-read. Sequence 00 is paired with raw drive `2011_10_03_drive_0027`; the
-evaluation pose file is `data/kitti_odometry_poses/00.txt`.
+## Run
 
-KITTI sources:
+```bash
+cd "/Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO"
+source .venv/bin/activate
 
-- https://www.cvlibs.net/datasets/kitti/raw_data.php
-- https://www.cvlibs.net/datasets/kitti/eval_odometry.php
-- https://www.cvlibs.net/publications/Geiger2013IJRR.pdf
-
-## Prepare the orthophoto once
-
-Run this from the project folder:
-
-```text
-python scripts/prepare_kitti_orthophoto.py outputs/osm_roads.geojson
-```
-
-The script downloads only the official LGL DOP20 crop that surrounds the map
-(about 1 MB at 0.4 m/pixel) and creates:
-
-- `dop20.jpg` and `dop20.jgw`;
-- `road_mask.png` and `road_mask.pgw`;
-- `orthophoto_road_mask_overlay.jpg` for visual inspection;
-- `source_and_processing.json` with the exact WMS request, CRS, attribution,
-  processing method, and limitations.
-
-The mask is explicitly **OSM-seeded**. OSM limits the image search to coarse
-road corridors; orthophoto colour and texture determine the road-area pixels.
-It is therefore an orthophoto refinement of OSM, not an independent map.
-
-No LiDAR, camera, GNSS sample, or reference pose is used to construct the
-online orthophoto residual. The downloaded DOP20 raster uses ETRS89 / UTM zone
-32 (`EPSG:25832`); the filter state uses WGS84 / UTM zone 32
-(`EPSG:32632`). The constraint transforms between them with `pyproj` before
-metric distance is evaluated.
-
-## Run the comparison
-
-```text
 python run_kitti_comparison.py \
-  /Users/ekremserdarozturk/Desktop/Projects/Datasets/KITTI_RAW/2011_10_03 \
-  --date 2011_10_03 --drive 0027 \
-  --map-source outputs/osm_roads.geojson \
-  --orthophoto-mask data/kitti_orthophoto/2011_10_03_drive_0027/road_mask.png \
-  --modes gnss_imu one_step_lateral one_step_orthophoto_boundary one_step_osm_orthophoto \
-  --gnss-stride 10 --gnss-outage 20:40 --no-show
+  "/Users/ekremserdarozturk/Desktop/Projects/Datasets/KITTI_RAW/2011_10_03/2011_10_03_drive_0027_sync" \
+  --imu-source "/Users/ekremserdarozturk/Desktop/Projects/Datasets/KITTI_RAW/2011_10_03/2011_10_03_drive_0027_extract" \
+  --reference-poses "data/kitti_odometry_poses/00.txt" \
+  --reference-kind proxy \
+  --gnss-stride 10 \
+  --gnss-outage 20:40 \
+  --no-show
 ```
 
-The modes mean:
+`--gnss-stride 10` supplies an OXTS GNSS update at approximately 1 Hz because
+the synchronized GNSS epochs are approximately 10 Hz. It does not reduce the
+100 Hz IMU propagation rate. `--gnss-outage 20:40`
+withholds those updates between 20 s and 40 s. This is a controlled robustness
+experiment; it must not be described as a naturally occurring KITTI outage.
 
-- `gnss_imu`: IMU prediction plus sparse GNSS corrections;
-- `one_step_lateral`: OSM cross-track pseudo-measurement;
-- `one_step_orthophoto_boundary`: road-area distance-field
-  pseudo-measurement;
-- `one_step_osm_orthophoto`: OSM heading plus orthophoto road-boundary updates
-  in the same ESIKF state.
+Do not repeat the script name after it. The item immediately after
+`python run_kitti_comparison.py` is the synchronized drive folder. The runner
+now also recognizes and removes one accidentally duplicated script name, but
+the command above is the canonical form.
 
-For the orthophoto boundary, the road mask defines the set
-`R_ortho`. The update activates only outside that set:
+The default output is `outputs/kitti_comparison_current/`. The figures in
+`clear_figures/` answer one question each: where the estimates travel, when the
+map helps, how the methods compare by RMSE, and how the baseline and best map
+constraint behave in three automatically selected clear road turns. Pass
+`--detailed` only when the dense engineering diagnostics are needed.
 
-```text
-d_o(p) = distance(p, R_ortho)
-r_o    = -d_o(p)
-H_o    = gradient d_o(p)
+KITTI OXTS velocity is not used as an independent measurement update. The
+RT3003 reports a fused GPS/IMU navigation solution, so feeding its velocity
+back into this IMU-driven ESKF would reuse inertial information. In contrast,
+the railway experiment derives velocity causally from GNSS positions and uses
+its propagated covariance in the joint position/velocity update.
+
+## Saved historical run
+
+The repository contains CSV files from an earlier KITTI experiment. Rebuild
+clear explanatory figures from them with:
+
+```bash
+python scripts/rebuild_kitti_story_from_saved_csv.py
 ```
 
-The scalar residual is NIS-gated before it can change the state. A position
-already inside the road area produces no orthophoto correction.
+These figures help explain the behavior, but their values must be regenerated
+with the current 18-state ESKF before they are final thesis evidence.
 
-## Outputs
+## Reference rule
 
-`outputs/kitti_comparison/` contains:
+The KITTI OXTS packets combine GPS and IMU in one RT3003 navigation system.
+The commonly distributed sequence-00 odometry poses are therefore not treated
+as an independent sensor reference by this project. Pass
+`--reference-kind proxy` to create exploratory plots with an explicit warning.
+Those RMSE values must not be reported as independently validated accuracy.
 
-- one mathematical diagnostic page per mode;
-- a common trajectory/RMSE comparison;
-- `00_orthophoto_map_comparison.png`, showing the DOP20 image, extracted road
-  area, OSM geometry, reference, accepted orthophoto updates, and all estimator
-  trajectories in the same UTM frame;
-- a per-epoch CSV with prediction, correction, covariance, GNSS/map NIS,
-  constraint activation, and gate decisions.
+For thesis-level KITTI accuracy claims, supply a trajectory produced without
+the OXTS data used by this filter, for example an independently processed
+camera/LiDAR trajectory, and declare `--reference-kind independent`. The
+railway file `Ref_Intermetric_UTM.txt` cannot be used for KITTI: it describes a
+different route in a different experiment and coordinate context.
 
-The official odometry trajectory is evaluation-only. Its first 20 frames are
-used to determine one rigid 2D alignment to UTM; no scale and no later
-reference positions are supplied to the estimator.
+## Limitations
 
-## Thesis limitations to report
-
-- KITTI synchronized OXTS is about 10 Hz; it is not a high-rate raw-IMU study.
-- KITTI odometry ground truth comes from its high-grade GPS/IMU unit, so the
-  outage test is controlled degradation, not an independent reference sensor.
-- The automatic road mask must be visually checked. For final evidence, use a
-  manually verified mask or a validated aerial-road segmentation model.
-- The current DOP20 is newer than the 2011 KITTI drive; temporal map changes
-  can affect the result.
-- DOP20 attribution: Landesamt für Geoinformation und Landentwicklung
-  Baden-Württemberg (LGL), Datenlizenz Deutschland – Namensnennung – Version
-  2.0.
+- KITTI OXTS combines high-grade GPS/IMU information; an OXTS-derived odometry
+  pose file is not a physically independent reference sensor.
+- The first 20 selected frames rigidly align the odometry trajectory to UTM for
+  evaluation only.
+- Sparse GNSS and the 20–40 s outage are deliberately simulated.
+- The KITTI map must come from the KITTI area; the railway map cannot be reused.
+- KITTI demonstrates urban robustness. It does not determine which constraint
+  is best for the railway dataset.

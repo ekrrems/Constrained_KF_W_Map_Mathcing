@@ -1,72 +1,44 @@
-# Map constraints used by the MATLAB GNSS/IMU pipeline
+# Map-constraint literature and implemented methods
 
-This note records the rationale behind the implemented pseudo-measurements. It
-also separates constraints that are already usable from extensions that need a
-better map or additional measurements.
+The thesis compares map-derived observations inside one common Cartesian
+GNSS/IMU ESKF. A cited paper is used only for the component actually reproduced
+in that architecture. Complete algorithms with a different state space are
+kept as related work.
 
-## Implemented experiment modes
+## Implemented comparison
 
-| Mode | Map information | Where correction occurs |
-|---|---|---|
-| `imu_only` | none | no measurement correction |
-| `gnss_imu` | none | GNSS position update inside ESIKF |
-| `two_step` | nearest track point and direction | output trajectory only; ESIKF is unchanged |
-| `one_step_heading` | segment direction | yaw error-state update |
-| `one_step_lateral` | segment normal and cross-track distance | scalar cross-track position update |
-| `one_step_pose` | nearest point and segment direction | anisotropic XY plus yaw update |
+| Mode | Implemented observation | Literature relationship |
+| --- | --- | --- |
+| `gnss_imu` | loose GNSS position and causal GNSS-derived velocity update in an IMU-driven ESKF | Solà-style error state; stochastic ideas from Frolow, Zhang, and Schwieger (2026); not an exact reproduction |
+| `two_step` | orthogonal projection of the reported output onto the selected segment; state and covariance unchanged | conventional output-only map-matching baseline |
+| `one_step_map_heading` | directed segment tangent as a speed-weighted heading pseudo-measurement, with association and innovation consistency gates | Fouque, Bonnifait, and Betaille (2008) map-heading method embedded in this thesis's ESKF |
+| `one_step_cross_track` | zero signed line-normal distance, `n.T @ (p - q) = 0` | standard equality pseudo-measurement/plane-fusion formulation; not Winter et al.'s IMM |
+| `one_step_combined` | stacked line-normal coordinate and map-heading residual | thesis experiment; not attributed as a complete published algorithm |
 
-The pose constraint intentionally has a large along-track variance and a small
-cross-track variance. A polyline says much more about where the vehicle is
-normal to the track than where it is along that track. Treating the projected
-point as an accurate isotropic 2D position would count an arbitrary projection
-as if it were a real sensor observation.
+All three direct methods use the same association manager. It retains several
+plausible segment alternatives, reports score-derived confidence and ambiguity,
+and suppresses the map update when competing ways cannot be separated. It is a
+conservative front end around one ESKF, not a Rao-Blackwellized particle filter.
 
-## Literature basis
+## Related state-of-the-art architectures
 
-1. C. Fouque, P. Bonnifait, and D. Bétaille, “Enhancement of Global Vehicle
-   Localization using Navigable Road Maps and Dead-Reckoning,” IEEE/ION PLANS,
-   2008, DOI: 10.1109/PLANS.2008.4570082.
-   https://www.ion.org/publications/abstract.cfm?articleID=7886
+Winter, Willert, and Adamy (2019) use a three-model interacting multiple-model
+filter to identify straight, circular-arc, or other track geometry online. This
+is useful related work, but it is not the source of the implemented line-normal
+observation because the thesis starts from supplied map geometry.
 
-   This is the direct basis of `one_step_heading`: the road direction is used as
-   a Kalman-filter heading observation. The implementation follows the paper's
-   conservative principle by rejecting distant or ambiguous associations and
-   weakening heading information at low speed.
+Heirich (2016) uses a topological one-dimensional railway state and a
+Rao-Blackwellized particle filter. Separate particles represent track ID,
+along-track position, and direction, with embedded Kalman filters for continuous
+states. A faithful reproduction requires a connected switch map and labeled
+switch-way reference data. Calling the current association manager an RBPF
+would therefore be incorrect.
 
-2. H. Winter, V. Willert, and J. Adamy, “Train-borne Localization Exploiting
-   Track-Geometry Constraints — A Practical Evaluation,” 2019.
-   https://arxiv.org/abs/1906.07569
+The EGNSS MATE project reports a bank of on-path Kalman filters, one per
+recursively maintained path hypothesis. This is a strong modern comparator for
+track-selective localization, but it changes the state model and research
+question. It is not silently substituted for the assigned common-ESKF
+constraint comparison.
 
-   This motivates the cross-track/lateral constraint. The reported benefit of
-   rail geometry is primarily in cross-track accuracy, which maps naturally to
-   a scalar innovation along the matched segment normal.
-
-3. O. Heirich, “Bayesian Train Localization with Particle Filter, Loosely
-   Coupled GNSS, IMU, and a Track Map,” Journal of Sensors, 2016,
-   DOI: 10.1155/2016/2672640.
-   https://onlinelibrary.wiley.com/doi/10.1155/2016/2672640
-
-   This work models track geoposition, heading, and curvature and emphasizes
-   that parallel tracks and switches require multiple hypotheses. It supports
-   the combined pose experiment, but also explains why the present single-mode
-   ESIKF must skip ambiguous associations instead of pretending to resolve a
-   switch.
-
-## Important limitations
-
-- A map pseudo-measurement is valid only after successful data association.
-  The matcher therefore enforces a maximum distance and flags similarly scored
-  alternatives on other ways as ambiguous.
-- OSM geometry is not ground truth. Map uncertainty is included in every
-  pseudo-measurement and must later be estimated using the supplied reference
-  trajectory or orthophoto-derived geometry.
-- Heading is unreliable at low speed. Heading and pose updates are disabled
-  below the configured speed threshold.
-- Position and heading extracted from the same polyline are correlated. The
-  current pose model is an experiment, not a claim of independent information.
-- Curvature/yaw-rate constraints are a useful next extension, but should be
-  added only after map smoothing; finite differences of unsmoothed OSM nodes
-  create artificial curvature impulses.
-- At switches or parallel tracks, a single Gaussian ESIKF cannot represent
-  several discrete track hypotheses. An interacting-multiple-model, particle,
-  or multi-hypothesis front end is the appropriate later extension.
+For detailed implementation boundaries, reproducibility parameters, and full
+references, see `METHOD_PROVENANCE.md`.

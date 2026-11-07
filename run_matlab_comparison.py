@@ -1,55 +1,65 @@
-"""Run and visualize every MATLAB/Intermetric localization implementation."""
+"""Run the common railway-dataset comparison used by the thesis."""
 
 from __future__ import annotations
 
 import argparse
 import csv
+from datetime import datetime
 from pathlib import Path
+import sys
+
+if "--no-show" in sys.argv:
+    import matplotlib
+
+    matplotlib.use("Agg")
 
 import numpy as np
 
-from estimation.map_reference_evaluation import ReferencePolyline
-from estimation.orthophoto_road_constraint import (
-    GeoreferencedRoadMask,
-    OrthophotoRoadBoundaryConstraint,
+from estimation.map_constraint_models import MapConstraintParameters
+from estimation.gnss_imu_eskf import ProcessNoise
+from estimation.map_reference_evaluation import (
+    ReferencePolyline,
+    block_bootstrap_rmse_interval,
 )
 from map_matching.algorithms.map_track_matcher import TrackDatabaseMatcher
 from sensors.map_matlab_data_obtainer import MatlabDataObtainer
 from sensors.map_show_dataset_map import read_reference_nodes
 from src.map_matlab_main import (
-    DATA_FOLDER,
-    RECORDING_DATE,
-    RECORD_SET,
-    find_reference_file,
-    find_unique,
+    DATA_FOLDER, RECORDING_DATE, RECORD_SET, find_reference_file, find_unique,
     run_experiment,
 )
 from visualization.experiment_diagnostics import (
-    MODE_TITLES,
-    plot_dataset_comparison,
-    plot_mode_diagnostics,
+    MODE_TITLES, plot_dataset_comparison, plot_mode_diagnostics,
 )
-from visualization.orthophoto_map_comparison import (
-    plot_orthophoto_map_comparison,
-)
+from visualization.thesis_story_plots import save_thesis_story_figures
 
 
-BASELINE_MODES = (
-    "imu_only",
+DEFAULT_MODES = (
     "gnss_imu",
     "two_step",
-    "one_step_heading",
-    "one_step_lateral",
-    "one_step_pose",
+    "one_step_map_heading",
+    "one_step_cross_track",
+    "one_step_combined",
 )
-ORTHOPHOTO_MODES = (
-    "one_step_orthophoto_boundary",
-    "one_step_osm_orthophoto",
-)
-ALL_MODES = BASELINE_MODES + ORTHOPHOTO_MODES
-DEFAULT_ORTHOPHOTO_DIRECTORY = Path(
-    "data/matlab_orthophoto/2025_01_30_set_13"
-)
+
+
+def parse_outage(value: str) -> tuple[float, float]:
+    try:
+        start, end = (float(item) for item in value.split(":", 1))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Use START:END seconds") from exc
+    if end <= start:
+        raise argparse.ArgumentTypeError("Outage END must be greater than START")
+    return start, end
+
+
+def fresh_output_directory(requested: Path) -> Path:
+    """Never mix a current experiment with files from an older run."""
+    requested = Path(requested)
+    if not requested.exists() or not any(requested.iterdir()):
+        return requested
+    suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return requested.with_name(f"{requested.name}_{suffix}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,30 +68,115 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recording-date", default=RECORDING_DATE)
     parser.add_argument("--record-set", type=int, default=RECORD_SET)
     parser.add_argument(
-        "--modes", nargs="+", choices=ALL_MODES,
+        "--reference", type=Path,
         help=(
-            "Implementations to run; by default all base modes plus "
-            "orthophoto modes when a prepared road mask exists"
+            "Evaluation polyline. Defaults to Ref_Intermetric_UTM.txt under "
+            "--data-folder. A separately digitized orthophoto polyline can be "
+            "supplied here for a paper-aligned evaluation."
         ),
     )
-    parser.add_argument("--orthophoto-mask", type=Path)
-    parser.add_argument("--orthophoto-world-file", type=Path)
-    parser.add_argument("--orthophoto-image", type=Path)
-    parser.add_argument("--orthophoto-image-world-file", type=Path)
-    parser.add_argument("--orthophoto-crs", default="EPSG:25832")
-    parser.add_argument("--state-crs", default="EPSG:32632")
-    parser.add_argument("--orthophoto-boundary-std", type=float, default=2.0)
     parser.add_argument(
-        "--output", type=Path, default=Path("outputs/matlab_comparison"),
+        "--reference-max-distance", type=float, default=20.0,
+        help=(
+            "Maximum distance from recorded GNSS to the evaluation polyline "
+            "for reference coverage. Extrapolation beyond global endpoints "
+            "is always excluded."
+        ),
+    )
+    parser.add_argument("--modes", nargs="+", choices=DEFAULT_MODES)
+    parser.add_argument("--state-crs", default="EPSG:32632")
+    parser.add_argument("--map-lateral-std", type=float, default=2.0)
+    parser.add_argument("--map-heading-min-std-deg", type=float, default=3.0)
+    parser.add_argument("--map-heading-reference-speed", type=float, default=20.0)
+    parser.add_argument("--map-heading-min-speed", type=float, default=1.0)
+    parser.add_argument("--association-distance-std", type=float, default=2.0)
+    parser.add_argument("--association-heading-std-deg", type=float, default=10.0)
+    parser.add_argument("--association-ambiguity-margin", type=float, default=2.0)
+    parser.add_argument("--maximum-association-hypotheses", type=int, default=5)
+    parser.add_argument(
+        "--association-protocol",
+        choices=("end_to_end", "fixed_baseline"),
+        default="end_to_end",
+        help=(
+            "end_to_end lets every estimator associate from its own state; "
+            "fixed_baseline replays associations generated by the unchanged "
+            "GNSS/IMU baseline so only the map observation differs."
+        ),
+    )
+    parser.add_argument(
+        "--imu-body-frame",
+        choices=("professor_frd", "raw_flu"),
+        default="professor_frd",
+        help=(
+            "IMU convention. professor_frd applies the supplied AxisOrientation "
+            "and initializes a forward-right-down body frame; raw_flu retains "
+            "the source signs in a forward-left-up body frame."
+        ),
+    )
+    parser.add_argument(
+        "--gnss-lever-arm",
+        nargs=3,
+        type=float,
+        metavar=("X", "Y", "Z"),
+        default=(0.0, 0.7, -3.0),
+        help="Body-frame state-origin-to-GNSS-antenna lever arm in metres.",
+    )
+    parser.add_argument(
+        "--use-gnss-lever-arm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Model the GNSS antenna lever arm inside position and velocity "
+            "updates. Disabled by default because the supplied [0, 0.7, -3] m "
+            "arm is tied to the Ref_Nodes/left-rail evaluation origin, not the "
+            "Intermetric antenna-path reference."
+        ),
+    )
+    parser.add_argument(
+        "--planar", action="store_true",
+        help=(
+            "Use horizontal GNSS only. The default is a 3-D position update, "
+            "which also stabilizes height and vertical velocity."
+        ),
+    )
+    parser.add_argument(
+        "--gnss-outage", type=parse_outage, action="append", default=[],
+        help="Withhold GNSS over START:END seconds; may be repeated.",
+    )
+    parser.add_argument("--rtk-fixed-mode", type=int, default=4)
+    parser.add_argument("--rtk-float-mode", type=int, default=5)
+    parser.add_argument("--rtk-fixed-std", type=float, default=0.10)
+    parser.add_argument("--rtk-float-std", type=float, default=0.50)
+    parser.add_argument("--standalone-std", type=float, default=5.0)
+    parser.add_argument("--vertical-gnss-std", type=float, default=3.0)
+    parser.add_argument("--gyro-noise-sigma", type=float, default=0.01)
+    parser.add_argument("--accel-noise-sigma", type=float, default=0.10)
+    parser.add_argument("--gyro-bias-rw-sigma", type=float, default=1.0e-4)
+    parser.add_argument("--accel-bias-rw-sigma", type=float, default=1.0e-3)
+    parser.add_argument(
+        "--bootstrap-block", type=int, default=20,
+        help="Moving-block length in GNSS epochs for the RMSE confidence interval.",
+    )
+    parser.add_argument(
+        "--detailed", action="store_true",
+        help="Also create dense engineering diagnostics; clear figures are the default.",
+    )
+    parser.add_argument(
+        "--output", type=Path, default=Path("outputs/matlab_comparison")
     )
     parser.add_argument(
         "--show", action=argparse.BooleanOptionalAction, default=True,
-        help="Open each diagnostic figure; use --no-show for batch execution",
+        help="Open diagnostic figures; use --no-show for a batch run.",
     )
     return parser
 
 
-def write_diagnostics_csv(path: Path, result: dict, errors: np.ndarray) -> None:
+def write_diagnostics_csv(
+    path: Path,
+    result: dict,
+    errors: np.ndarray,
+    reference_covered: np.ndarray,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     prediction = np.asarray(result["prediction"])
     state = np.asarray(result["state_output"])
@@ -89,215 +184,313 @@ def write_diagnostics_csv(path: Path, result: dict, errors: np.ndarray) -> None:
     std_xy = np.asarray(result["position_std_xy_m"])
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
-        writer.writerow(
-            [
-                "timestamp_s", "reference_distance_m",
-                "predicted_easting_m", "predicted_northing_m",
-                "state_easting_m", "state_northing_m",
-                "output_easting_m", "output_northing_m",
-                "filter_correction_m", "external_output_correction_m",
-                "sigma_easting_m", "sigma_northing_m", "sigma_yaw_deg",
-                "heading_deg", "speed_mps", "gnss_nis", "gnss_accepted",
-                "map_nis", "map_accepted", "association_valid",
-                "orthophoto_nis", "orthophoto_accepted",
-            ]
-        )
+        writer.writerow([
+            "timestamp_s", "reference_distance_m", "reference_covered",
+            "predicted_easting_m",
+            "predicted_northing_m", "state_easting_m", "state_northing_m",
+            "output_easting_m", "output_northing_m", "filter_correction_m",
+            "external_output_correction_m", "sigma_easting_m",
+            "sigma_northing_m", "sigma_yaw_deg", "heading_deg",
+            "horizontal_speed_mps", "vertical_velocity_mps", "height_m",
+            "covariance_min_eigenvalue", "covariance_symmetry_error",
+            "gnss_mode", "gnss_velocity_used", "gnss_dof", "gnss_nis",
+            "gnss_nis_threshold_99", "gnss_accepted",
+            "map_nis", "map_accepted", "association_valid",
+            "association_ambiguous", "hypothesis_count",
+            "association_best_probability", "association_effective_hypotheses",
+            "association_entropy", "selected_way_id",
+        ])
         for index, timestamp in enumerate(result["timestamps"]):
-            writer.writerow(
-                [
-                    timestamp, errors[index],
-                    prediction[index, 0], prediction[index, 1],
-                    state[index, 0], state[index, 1],
-                    output[index, 0], output[index, 1],
-                    np.linalg.norm(state[index, :2] - prediction[index, :2]),
-                    np.linalg.norm(output[index, :2] - state[index, :2]),
-                    std_xy[index, 0], std_xy[index, 1],
-                    result["yaw_std_deg"][index], result["heading_deg"][index],
-                    result["speed_mps"][index], result["gnss_nis"][index],
-                    int(result["gnss_accepted"][index]), result["map_nis"][index],
-                    int(result["map_accepted"][index]),
-                    int(result["association_valid"][index]),
-                    result["orthophoto_nis"][index],
-                    int(result["orthophoto_accepted"][index]),
-                ]
-            )
+            writer.writerow([
+                timestamp, errors[index], int(reference_covered[index]),
+                prediction[index, 0], prediction[index, 1],
+                state[index, 0], state[index, 1], output[index, 0], output[index, 1],
+                np.linalg.norm(state[index, :2] - prediction[index, :2]),
+                np.linalg.norm(output[index, :2] - state[index, :2]),
+                std_xy[index, 0], std_xy[index, 1], result["yaw_std_deg"][index],
+                result["heading_deg"][index],
+                result["horizontal_speed_mps"][index],
+                result["vertical_velocity_mps"][index], result["height_m"][index],
+                result["covariance_min_eigenvalue"][index],
+                result["covariance_symmetry_error"][index],
+                result["gnss_mode"][index], int(result["gnss_velocity_used"][index]),
+                result["gnss_dof"][index], result["gnss_nis"][index],
+                result["gnss_nis_threshold_99"][index],
+                int(result["gnss_accepted"][index]),
+                result["map_nis"][index], int(result["map_accepted"][index]),
+                int(result["association_valid"][index]),
+                int(result["association_ambiguous"][index]),
+                result["hypothesis_count"][index],
+                result["association_best_probability"][index],
+                result["association_effective_hypotheses"][index],
+                result["association_entropy"][index],
+                result["selected_way_id"][index],
+            ])
 
 
 def main() -> None:
     arguments = build_parser().parse_args()
-    default_mask = DEFAULT_ORTHOPHOTO_DIRECTORY / "road_mask.png"
-    if arguments.orthophoto_mask is None and default_mask.is_file():
-        arguments.orthophoto_mask = default_mask
-    if arguments.modes is None:
-        modes = list(BASELINE_MODES)
-        if arguments.orthophoto_mask is not None:
-            modes.extend(ORTHOPHOTO_MODES)
-    else:
-        modes = list(arguments.modes)
-    if any(mode in ORTHOPHOTO_MODES for mode in modes):
-        if arguments.orthophoto_mask is None:
-            raise ValueError(
-                "Orthophoto modes require --orthophoto-mask. Generate it with "
-                "scripts/prepare_orthophoto.py first."
-            )
-        road_map = GeoreferencedRoadMask.from_image_and_world_file(
-            arguments.orthophoto_mask,
-            arguments.orthophoto_world_file,
-            raster_crs=arguments.orthophoto_crs,
-            state_crs=arguments.state_crs,
-        )
-        orthophoto_constraint = OrthophotoRoadBoundaryConstraint(
-            road_map,
-            boundary_std_m=arguments.orthophoto_boundary_std,
-        )
-    else:
-        orthophoto_constraint = None
-
+    velocity_model = "none"
+    modes = list(DEFAULT_MODES if arguments.modes is None else arguments.modes)
+    map_parameters = MapConstraintParameters(
+        lateral_std_m=arguments.map_lateral_std,
+        minimum_heading_std_deg=arguments.map_heading_min_std_deg,
+        heading_reference_speed_mps=arguments.map_heading_reference_speed,
+        minimum_heading_speed_mps=arguments.map_heading_min_speed,
+    )
+    process_noise = ProcessNoise(
+        gyro_noise_sigma=arguments.gyro_noise_sigma,
+        accel_noise_sigma=arguments.accel_noise_sigma,
+        gyro_bias_random_walk_sigma=arguments.gyro_bias_rw_sigma,
+        accel_bias_random_walk_sigma=arguments.accel_bias_rw_sigma,
+    )
     data = MatlabDataObtainer(
         data_folder=arguments.data_folder,
         recording_date=arguments.recording_date,
         record_set=arguments.record_set,
         apply_supplied_bias=True,
-        apply_axis_orientation=False,
+        apply_axis_orientation=(arguments.imu_body_frame == "professor_frd"),
+        horizontal_gnss_std_m=arguments.standalone_std,
+        vertical_gnss_std_m=arguments.vertical_gnss_std,
+        fixed_rtk_horizontal_std_m=arguments.rtk_fixed_std,
+        float_rtk_horizontal_std_m=arguments.rtk_float_std,
+        fixed_rtk_mode=arguments.rtk_fixed_mode,
+        float_rtk_mode=arguments.rtk_float_mode,
+        gnss_velocity_method="none",
+        gnss_outages_s=tuple(arguments.gnss_outage),
     )
+    lever_arm_b_m = np.asarray(arguments.gnss_lever_arm, dtype=np.float64)
+    if not arguments.use_gnss_lever_arm:
+        lever_arm_b_m = np.zeros(3, dtype=np.float64)
+    elif arguments.imu_body_frame != "professor_frd":
+        raise ValueError(
+            "The default [0, 0.7, -3] m lever arm is defined in the professor "
+            "FRD convention. Supply a transformed arm or use "
+            "--no-use-gnss-lever-arm with --imu-body-frame raw_flu."
+        )
+    if arguments.record_set % 2 == 0:
+        lever_arm_b_m[1] *= -1.0
     map_path = find_unique(arguments.data_folder, "track.db")
-    print(f"OSM map:              {map_path.resolve()}")
-    matcher = TrackDatabaseMatcher(map_path, target_crs=arguments.state_crs)
-    reference_path = find_reference_file(arguments.data_folder)
-    print(f"Reference file:        {reference_path.resolve()}")
-    reference_points = np.asarray(
-        read_reference_nodes(reference_path), dtype=np.float64
+    matcher = TrackDatabaseMatcher(
+        map_path,
+        target_crs=arguments.state_crs,
+        nominal_map_distance_sigma_m=arguments.association_distance_std,
+        nominal_map_heading_sigma_deg=arguments.association_heading_std_deg,
+        ambiguity_score_margin=arguments.association_ambiguity_margin,
     )
+    reference_path = (
+        arguments.reference.expanduser()
+        if arguments.reference is not None
+        else find_reference_file(arguments.data_folder)
+    )
+    if not reference_path.is_file():
+        raise FileNotFoundError(f"Evaluation reference not found: {reference_path}")
+    reference_points = np.asarray(read_reference_nodes(reference_path), dtype=np.float64)
     reference = ReferencePolyline(reference_points)
     raw_xy = data.gnss_positions_utm_m[:, :2]
     raw_errors = reference.distances(raw_xy)
-    evaluation_mask = reference.coverage_mask(raw_xy, maximum_distance_m=20.0)
+    evaluation_mask = reference.coverage_mask(
+        raw_xy, maximum_distance_m=arguments.reference_max_distance
+    )
+    print(
+        f"Evaluation reference: {reference_path} | "
+        f"covered epochs={np.count_nonzero(evaluation_mask)}/{len(evaluation_mask)}"
+    )
     gnss_available = data.gnss_mode >= 0
 
+    arguments.output = fresh_output_directory(arguments.output)
     arguments.output.mkdir(parents=True, exist_ok=True)
     results: dict[str, dict] = {}
     errors_by_mode: dict[str, np.ndarray] = {}
+    fixed_association_schedule = None
+    if arguments.association_protocol == "fixed_baseline":
+        print("Building fixed association schedule from GNSS/IMU baseline ...")
+        association_source = run_experiment(
+            data, matcher, mode="two_step",
+            gnss_dimensions=2 if arguments.planar else 3,
+            use_gnss_velocity=False,
+            process_noise=process_noise,
+            map_parameters=map_parameters,
+            maximum_association_hypotheses=(
+                arguments.maximum_association_hypotheses
+            ),
+            imu_body_frame=(
+                "frd" if arguments.imu_body_frame == "professor_frd" else "flu"
+            ),
+            gnss_lever_arm_b_m=lever_arm_b_m,
+        )
+        fixed_association_schedule = association_source["association_schedule"]
     for index, mode in enumerate(modes, start=1):
         print(f"[{index}/{len(modes)}] Running {MODE_TITLES[mode]} ...")
         result = run_experiment(
-            data,
-            matcher,
-            mode=mode,
-            orthophoto_constraint=(
-                orthophoto_constraint if mode in ORTHOPHOTO_MODES else None
+            data, matcher, mode=mode,
+            gnss_dimensions=2 if arguments.planar else 3,
+            use_gnss_velocity=(velocity_model != "none"),
+            process_noise=process_noise,
+            map_parameters=map_parameters,
+            maximum_association_hypotheses=(
+                arguments.maximum_association_hypotheses
             ),
-            gnss_dimensions=2,
+            imu_body_frame=(
+                "frd" if arguments.imu_body_frame == "professor_frd" else "flu"
+            ),
+            gnss_lever_arm_b_m=lever_arm_b_m,
+            association_schedule=(
+                fixed_association_schedule if mode in DEFAULT_MODES[1:] else None
+            ),
         )
         errors = reference.distances(result["output"][:, :2])
         results[mode] = result
         errors_by_mode[mode] = errors
         figure_path = arguments.output / f"{index:02d}_{mode}_diagnostics.png"
         csv_path = arguments.output / f"{index:02d}_{mode}_epochs.csv"
-        plot_mode_diagnostics(
-            result=result,
-            reference_xy=reference_points,
-            raw_xy=raw_xy,
-            reference_errors_m=errors,
-            raw_errors_m=raw_errors,
-            save_path=figure_path,
-            dataset_label=(
-                f"Intermetric MATLAB data — {arguments.recording_date}, "
-                f"set {arguments.record_set}"
-            ),
-            reference_description=f"Nearest distance to {reference_path.name} (evaluation only)",
-            matcher=matcher,
-            evaluation_mask=evaluation_mask,
-            gnss_available=gnss_available,
-            show=arguments.show,
-        )
-        write_diagnostics_csv(csv_path, result, errors)
+        if arguments.detailed:
+            plot_mode_diagnostics(
+                result=result, reference_xy=reference_points, raw_xy=raw_xy,
+                reference_errors_m=errors, raw_errors_m=raw_errors,
+                save_path=figure_path,
+                dataset_label=(f"Intermetric MATLAB data — {arguments.recording_date}, "
+                               f"set {arguments.record_set}"),
+                reference_description=(
+                    f"Nearest distance to {reference_path.name} (evaluation only)"
+                ),
+                matcher=matcher, evaluation_mask=evaluation_mask,
+                gnss_available=gnss_available, show=arguments.show,
+            )
+        write_diagnostics_csv(csv_path, result, errors, evaluation_mask)
         covered = errors[evaluation_mask]
         print(
             f"    RMSE={np.sqrt(np.mean(covered**2)):.3f} m | "
-            f"OSM accepted={np.count_nonzero(result['map_accepted'])} | "
-            f"orthophoto accepted={np.count_nonzero(result['orthophoto_accepted'])} | "
-            f"saved {figure_path}"
+            f"map accepted={np.count_nonzero(result['map_accepted'])} | "
+            f"ambiguous={np.count_nonzero(result['association_ambiguous'])}"
         )
 
     comparison_path = arguments.output / "00_all_modes_comparison.png"
-    rmses = plot_dataset_comparison(
-        results=results,
-        reference_xy=reference_points,
-        raw_xy=raw_xy,
-        errors_by_mode=errors_by_mode,
-        raw_errors_m=raw_errors,
-        timestamps=data.gnss_timestamps,
-        save_path=comparison_path,
-        dataset_label=(
-            f"Intermetric MATLAB data — {arguments.recording_date}, "
-            f"set {arguments.record_set}"
-        ),
-        matcher=matcher,
-        evaluation_mask=evaluation_mask,
-        gnss_available=gnss_available,
-        show=arguments.show,
-    )
+    if arguments.detailed:
+        rmses = plot_dataset_comparison(
+            results=results, reference_xy=reference_points, raw_xy=raw_xy,
+            errors_by_mode=errors_by_mode, raw_errors_m=raw_errors,
+            timestamps=data.gnss_timestamps, save_path=comparison_path,
+            dataset_label=(f"Intermetric MATLAB data — {arguments.recording_date}, "
+                           f"set {arguments.record_set}"),
+            matcher=matcher, evaluation_mask=evaluation_mask,
+            gnss_available=gnss_available, show=arguments.show,
+        )
+    else:
+        rmses = {
+            mode: float(np.sqrt(np.mean(values[evaluation_mask] ** 2)))
+            for mode, values in {"raw_gnss": raw_errors, **errors_by_mode}.items()
+        }
     summary_path = arguments.output / "00_rmse_summary.csv"
     with summary_path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
-        writer.writerow(["mode", "rmse_m"])
-        writer.writerows(rmses.items())
-
-    orthophoto_map_path = None
-    if arguments.orthophoto_mask is not None:
-        orthophoto_directory = arguments.orthophoto_mask.parent
-        orthophoto_image = (
-            arguments.orthophoto_image
-            if arguments.orthophoto_image is not None
-            else orthophoto_directory / "dop20.jpg"
-        )
-        orthophoto_image_world = (
-            arguments.orthophoto_image_world_file
-            if arguments.orthophoto_image_world_file is not None
-            else orthophoto_directory / "dop20.jgw"
-        )
-        orthophoto_mask_world = (
-            arguments.orthophoto_world_file
-            if arguments.orthophoto_world_file is not None
-            else arguments.orthophoto_mask.with_suffix(".pgw")
-        )
-        if (
-            orthophoto_image.is_file()
-            and orthophoto_image_world.is_file()
-            and orthophoto_mask_world.is_file()
-        ):
-            orthophoto_map_path = arguments.output / "00_orthophoto_map_comparison.png"
-            plot_orthophoto_map_comparison(
-                results=results,
-                errors_by_mode=errors_by_mode,
-                reference_xy=reference_points,
-                raw_xy=raw_xy,
-                matcher=matcher,
-                orthophoto_path=orthophoto_image,
-                orthophoto_world_file=orthophoto_image_world,
-                road_mask_path=arguments.orthophoto_mask,
-                road_mask_world_file=orthophoto_mask_world,
-                raster_crs=arguments.orthophoto_crs,
-                state_crs=arguments.state_crs,
-                save_path=orthophoto_map_path,
-                dataset_label=(
-                    f"Intermetric MATLAB data {arguments.recording_date}, "
-                    f"set {arguments.record_set}"
-                ),
-                reference_description=(
-                    f"{reference_path.name} is used only for evaluation."
-                ),
-                evaluation_mask=evaluation_mask,
-                show=arguments.show,
+        writer.writerow([
+            "mode", "association_protocol", "count", "mean_absolute_m",
+            "median_absolute_m", "rmse_m",
+            "percentile_95_absolute_m", "maximum_absolute_m", "signed_bias_m",
+            "rmse_ci95_low_m", "rmse_ci95_high_m", "gnss_accepted",
+            "gnss_nis_median", "gnss_nis_above_99pct_gate_percent",
+            "map_accepted", "association_available", "association_ambiguous",
+            "map_rejected", "minimum_covariance_eigenvalue",
+            "maximum_covariance_symmetry_error",
+        ])
+        all_positions = {
+            "raw_gnss": raw_xy,
+            **{mode: result["output"][:, :2] for mode, result in results.items()},
+        }
+        all_errors = {"raw_gnss": raw_errors, **errors_by_mode}
+        for mode, positions in all_positions.items():
+            signed = reference.signed_distances(positions)[evaluation_mask]
+            statistics = reference.signed_statistics(positions[evaluation_mask])
+            ci_low, ci_high = block_bootstrap_rmse_interval(
+                np.abs(signed),
+                block_length=min(arguments.bootstrap_block, len(signed)),
             )
-
+            result = results.get(mode)
+            if result is None:
+                median_gnss_nis = ""
+                gnss_nis_exceedance_percent = ""
+            else:
+                nis = np.asarray(result["gnss_nis"], dtype=np.float64)
+                threshold = np.asarray(
+                    result["gnss_nis_threshold_99"], dtype=np.float64
+                )
+                finite_nis = np.isfinite(nis) & np.isfinite(threshold)
+                median_gnss_nis = (
+                    float(np.median(nis[finite_nis]))
+                    if np.any(finite_nis) else np.nan
+                )
+                gnss_nis_exceedance_percent = (
+                    100.0 * float(np.mean(nis[finite_nis] > threshold[finite_nis]))
+                    if np.any(finite_nis) else np.nan
+                )
+            writer.writerow([
+                mode, arguments.association_protocol, statistics.count,
+                statistics.mean_m, statistics.median_m,
+                statistics.rmse_m, statistics.percentile_95_m,
+                statistics.maximum_m, statistics.signed_bias_m, ci_low, ci_high,
+                "" if result is None else int(np.count_nonzero(result["gnss_accepted"])),
+                median_gnss_nis, gnss_nis_exceedance_percent,
+                "" if result is None else int(np.count_nonzero(result["map_accepted"])),
+                "" if result is None else int(np.count_nonzero(result["association_valid"])),
+                "" if result is None else int(np.count_nonzero(result["association_ambiguous"])),
+                "" if result is None else int(np.count_nonzero(
+                    np.asarray(result["association_valid"], dtype=bool)
+                    & ~np.asarray(result["map_accepted"], dtype=bool)
+                )),
+                "" if result is None else float(np.min(result["covariance_min_eigenvalue"])),
+                "" if result is None else float(np.max(result["covariance_symmetry_error"])),
+            ])
+    clear_paths = save_thesis_story_figures(
+        results=results,
+        errors_by_mode=errors_by_mode,
+        raw_xy=raw_xy,
+        raw_errors_m=raw_errors,
+        reference_xy=reference_points,
+        timestamps=data.gnss_timestamps,
+        gnss_available=gnss_available,
+        evaluation_mask=evaluation_mask,
+        output_directory=arguments.output / "clear_figures",
+        dataset_title=(
+            f"Intermetric railway data — {arguments.recording_date}, "
+            f"set {arguments.record_set}"
+        ),
+    )
     print("\nCommon-reference RMSE")
+    print(
+        "  Map stochastic model: "
+        f"lateral={map_parameters.lateral_std_m:.2f} m, "
+        f"minimum heading={map_parameters.minimum_heading_std_deg:.2f} deg, "
+        f"heading reference speed={map_parameters.heading_reference_speed_mps:.2f} m/s"
+    )
+    print(f"  Association protocol: {arguments.association_protocol}")
+    mode_counts = {
+        int(value): int(count)
+        for value, count in zip(*np.unique(data.gnss_mode_recorded, return_counts=True))
+    }
+    print(
+        "  GNSS observation model: "
+        f"{'2-D planar' if arguments.planar else '3-D'}; "
+        f"velocity={velocity_model}; "
+        f"recorded mode counts={mode_counts}"
+    )
+    print(
+        "  IMU/antenna model: "
+        f"frame={arguments.imu_body_frame}; "
+        f"lever arm={lever_arm_b_m.tolist()} m"
+    )
+    print(
+        "  Adaptive position sigma: "
+        f"mode {arguments.rtk_fixed_mode}={arguments.rtk_fixed_std:.2f} m, "
+        f"mode {arguments.rtk_float_mode}={arguments.rtk_float_std:.2f} m, "
+        f"fallback={arguments.standalone_std:.2f} m"
+    )
     for mode, rmse in rmses.items():
-        print(f"  {mode:24s} {rmse:9.3f} m")
-    print(f"\nComparison figure: {comparison_path.resolve()}")
-    if orthophoto_map_path is not None:
-        print(f"Orthophoto map:    {orthophoto_map_path.resolve()}")
+        print(f"  {mode:30s} {rmse:9.3f} m")
+    if arguments.detailed:
+        print(f"\nDetailed comparison: {comparison_path.resolve()}")
     print(f"All diagnostics:   {arguments.output.resolve()}")
+    print(f"Clear figures:     {clear_paths[0].parent.resolve()}")
 
 
 if __name__ == "__main__":

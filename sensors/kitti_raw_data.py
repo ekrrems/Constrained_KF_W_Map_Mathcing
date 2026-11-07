@@ -41,13 +41,23 @@ class KittiStorageSummary:
 
 
 class KittiDriveSource:
-    """Read one synchronized KITTI drive from a directory or ZIP archive."""
+    """Read one KITTI sync or extract drive from a directory or ZIP archive."""
 
-    def __init__(self, source: Path, date: str, drive: str) -> None:
+    def __init__(
+        self,
+        source: Path,
+        date: str,
+        drive: str,
+        *,
+        dataset: str = "sync",
+    ) -> None:
         self.source = Path(source).expanduser().resolve()
         self.date = str(date)
         self.drive = f"{int(drive):04d}"
-        self.drive_name = f"{self.date}_drive_{self.drive}_sync"
+        if dataset not in {"sync", "extract"}:
+            raise ValueError("dataset must be 'sync' or 'extract'")
+        self.dataset = dataset
+        self.drive_name = f"{self.date}_drive_{self.drive}_{self.dataset}"
         self._zip: zipfile.ZipFile | None = None
         self._zip_prefix = ""
         self._directory: Path | None = None
@@ -178,7 +188,7 @@ def _parse_timestamp(line: str) -> datetime:
 
 
 class KittiRawDataObtainer:
-    """Expose synchronized KITTI OXTS packets through the existing ESIKF API."""
+    """Expose synchronized KITTI OXTS packets through the railway ESKF API."""
 
     def __init__(
         self,
@@ -186,20 +196,33 @@ class KittiRawDataObtainer:
         date: str,
         drive: str,
         *,
+        imu_source: Path | None = None,
         start_frame: int = 0,
         stop_frame: int | None = None,
         frame_step: int = 1,
         gnss_stride: int = 1,
         gnss_outages_s: tuple[tuple[float, float], ...] = (),
+        interpolate_imu_at_gnss: bool = True,
     ) -> None:
         if min(frame_step, gnss_stride) <= 0:
             raise ValueError("frame_step and gnss_stride must be positive")
-        self.drive_source = KittiDriveSource(source, date, drive)
+        self.drive_source = KittiDriveSource(source, date, drive, dataset="sync")
+        self.imu_drive_source = (
+            self.drive_source
+            if imu_source is None
+            else KittiDriveSource(imu_source, date, drive, dataset="extract")
+        )
         self.source = Path(source).expanduser().resolve()
+        self.imu_source = (
+            self.source
+            if imu_source is None
+            else Path(imu_source).expanduser().resolve()
+        )
         self.date = date
         self.drive = f"{int(drive):04d}"
         self.gnss_stride = int(gnss_stride)
         self.gnss_outages_s = tuple(gnss_outages_s)
+        self.interpolate_imu_at_gnss = bool(interpolate_imu_at_gnss)
 
         oxts_files = self.drive_source.list_files("oxts/data", ".txt")
         timestamp_lines = [
@@ -219,11 +242,10 @@ class KittiRawDataObtainer:
         self.oxts_files = [oxts_files[index] for index in selection]
         absolute_times = [_parse_timestamp(timestamp_lines[index]) for index in selection]
         initial_time = absolute_times[0]
-        self.imu_timestamps = np.asarray(
+        self.gnss_timestamps = np.asarray(
             [(value - initial_time).total_seconds() for value in absolute_times],
             dtype=np.float64,
         )
-        self.gnss_timestamps = self.imu_timestamps.copy()
 
         packets = []
         for relative_path in self.oxts_files:
@@ -235,6 +257,70 @@ class KittiRawDataObtainer:
                 )
             packets.append(values)
         self.oxts = np.asarray(packets, dtype=np.float64)
+
+        if self.imu_drive_source is self.drive_source:
+            imu_packets = self.oxts
+            imu_absolute_times = absolute_times
+            self.imu_frame_indices = self.frame_indices.copy()
+        else:
+            imu_files = self.imu_drive_source.list_files("oxts/data", ".txt")
+            imu_timestamp_lines = [
+                line
+                for line in self.imu_drive_source.read_text(
+                    "oxts/timestamps.txt"
+                ).splitlines()
+                if line.strip()
+            ]
+            if len(imu_files) != len(imu_timestamp_lines):
+                raise ValueError(
+                    f"Extract OXTS files ({len(imu_files)}) and timestamps "
+                    f"({len(imu_timestamp_lines)}) do not agree"
+                )
+            all_imu_absolute_times = [
+                _parse_timestamp(line) for line in imu_timestamp_lines
+            ]
+            relative_imu_times = np.asarray(
+                [
+                    (value - initial_time).total_seconds()
+                    for value in all_imu_absolute_times
+                ],
+                dtype=np.float64,
+            )
+            start_index = max(
+                0, int(np.searchsorted(relative_imu_times, 0.0, side="left")) - 1
+            )
+            end_index = int(
+                np.searchsorted(
+                    relative_imu_times,
+                    self.gnss_timestamps[-1],
+                    side="right",
+                )
+            )
+            if end_index - start_index < 2:
+                raise ValueError(
+                    "The 100 Hz extract IMU does not overlap the selected sync frames"
+                )
+            self.imu_frame_indices = np.arange(
+                start_index, end_index, dtype=np.int64
+            )
+            imu_absolute_times = all_imu_absolute_times[start_index:end_index]
+            imu_packets_list = []
+            for relative_path in imu_files[start_index:end_index]:
+                values = np.fromstring(
+                    self.imu_drive_source.read_text(relative_path), sep=" "
+                )
+                if values.size != OXTS_FIELD_COUNT:
+                    raise ValueError(
+                        f"Expected {OXTS_FIELD_COUNT} OXTS fields in "
+                        f"{relative_path}, got {values.size}"
+                    )
+                imu_packets_list.append(values)
+            imu_packets = np.asarray(imu_packets_list, dtype=np.float64)
+
+        self.imu_timestamps = np.asarray(
+            [(value - initial_time).total_seconds() for value in imu_absolute_times],
+            dtype=np.float64,
+        )
         self.gnss_latitude_deg = self.oxts[:, 0].copy()
         self.gnss_longitude_deg = self.oxts[:, 1].copy()
         self.gnss_altitude_m = self.oxts[:, 2].copy()
@@ -248,8 +334,16 @@ class KittiRawDataObtainer:
         self.gnss_positions_local_m = (
             self.gnss_positions_utm_m - self.local_origin_utm_m
         )
-        self.acceleration_mps2 = self.oxts[:, 11:14].copy()
-        self.angular_rate_radps = self.oxts[:, 17:20].copy()
+        # KITTI OXTS fields 6 and 7 are north/east velocity and field 10 is
+        # upward velocity. They belong to the RT3003 GPS/IMU navigation
+        # solution. They are retained for diagnostics, but are deliberately not
+        # marked as an independent GNSS observation because feeding them back
+        # into an IMU filter would reuse inertial information.
+        self.gnss_velocities_utm_mps = np.column_stack(
+            (self.oxts[:, 7], self.oxts[:, 6], self.oxts[:, 10])
+        )
+        self.acceleration_mps2 = imu_packets[:, 11:14].copy()
+        self.angular_rate_radps = imu_packets[:, 17:20].copy()
         self.reference_roll_pitch_yaw_rad = self.oxts[:, 3:6].copy()
 
         available = (np.arange(len(selection)) % self.gnss_stride) == 0
@@ -263,16 +357,18 @@ class KittiRawDataObtainer:
         available[0] = True
         self.gnss_available = available
 
-        intervals = np.diff(self.imu_timestamps)
-        rate = float(1.0 / np.median(intervals))
+        imu_intervals = np.diff(self.imu_timestamps)
+        imu_rate = float(1.0 / np.median(imu_intervals))
+        gnss_intervals = np.diff(self.gnss_timestamps)
+        gnss_rate = float(1.0 / np.median(gnss_intervals))
         self.imu_metadata = ImuMetadata(
-            sampling_rate_hz=rate,
+            sampling_rate_hz=imu_rate,
             axis_orientation=np.ones(6, dtype=np.int64),
             supplied_bias=np.zeros(6, dtype=np.float64),
-            source_file=self.source,
+            source_file=self.imu_source,
         )
         self.gnss_metadata = GnssMetadata(
-            sampling_rate_hz=rate,
+            sampling_rate_hz=gnss_rate,
             source_file=self.source,
             utm_zone=zone,
             local_origin_utm_m=self.local_origin_utm_m.copy(),
@@ -284,9 +380,11 @@ class KittiRawDataObtainer:
 
     def close(self) -> None:
         self.drive_source.close()
+        if self.imu_drive_source is not self.drive_source:
+            self.imu_drive_source.close()
 
     def __len__(self) -> int:
-        return 2 * len(self.imu_timestamps)
+        return len(self.imu_timestamps) + len(self.gnss_timestamps)
 
     def imu_reading(self, index: int) -> ImuReading:
         return ImuReading(
@@ -300,6 +398,8 @@ class KittiRawDataObtainer:
         covariance = np.diag(
             [position_accuracy**2, position_accuracy**2, (2.0 * position_accuracy) ** 2]
         )
+        velocity_accuracy = float(np.clip(self.oxts[index, 24], 0.05, 20.0))
+        velocity_covariance = np.eye(3, dtype=np.float64) * velocity_accuracy**2
         mode = int(self.oxts[index, 27]) if self.gnss_available[index] else -1
         return GnssReading(
             timestamp=float(self.gnss_timestamps[index]),
@@ -310,13 +410,60 @@ class KittiRawDataObtainer:
             position_utm_m=self.gnss_positions_utm_m[index].copy(),
             position_local_m=self.gnss_positions_local_m[index].copy(),
             mode=mode,
-            covariance_m2=covariance,
+            position_covariance_m2=covariance,
+            velocity_utm_mps=self.gnss_velocities_utm_mps[index].copy(),
+            velocity_covariance_m2ps2=velocity_covariance,
+            position_velocity_cross_covariance=np.zeros((3, 3), dtype=np.float64),
+            velocity_valid=False,
+        )
+
+    def _interpolated_imu(self, timestamp: float, left: int, right: int) -> ImuReading:
+        left_time = self.imu_timestamps[left]
+        right_time = self.imu_timestamps[right]
+        fraction = float((timestamp - left_time) / (right_time - left_time))
+        return ImuReading(
+            timestamp=float(timestamp),
+            acceleration_mps2=(
+                (1.0 - fraction) * self.acceleration_mps2[left]
+                + fraction * self.acceleration_mps2[right]
+            ),
+            angular_rate_radps=(
+                (1.0 - fraction) * self.angular_rate_radps[left]
+                + fraction * self.angular_rate_radps[right]
+            ),
+            interpolated=True,
         )
 
     def __iter__(self) -> Iterator[ImuReading | GnssReading]:
-        for index in range(len(self.imu_timestamps)):
-            yield self.imu_reading(index)
-            yield self.gnss_reading(index)
+        imu_index = 0
+        tolerance = 1.0e-9
+        for gnss_index, gnss_time in enumerate(self.gnss_timestamps):
+            while (
+                imu_index < len(self.imu_timestamps)
+                and self.imu_timestamps[imu_index] < gnss_time - tolerance
+            ):
+                yield self.imu_reading(imu_index)
+                imu_index += 1
+
+            if imu_index < len(self.imu_timestamps) and abs(
+                self.imu_timestamps[imu_index] - gnss_time
+            ) <= tolerance:
+                yield self.imu_reading(imu_index)
+                imu_index += 1
+            elif (
+                self.interpolate_imu_at_gnss
+                and 0 < imu_index < len(self.imu_timestamps)
+                and self.imu_timestamps[imu_index - 1] < gnss_time
+                < self.imu_timestamps[imu_index]
+            ):
+                yield self._interpolated_imu(
+                    float(gnss_time), imu_index - 1, imu_index
+                )
+            yield self.gnss_reading(gnss_index)
+
+        while imu_index < len(self.imu_timestamps):
+            yield self.imu_reading(imu_index)
+            imu_index += 1
 
     def velodyne_frame(self, selected_index: int) -> tuple[np.ndarray, np.ndarray] | None:
         original_frame = int(self.frame_indices[selected_index])

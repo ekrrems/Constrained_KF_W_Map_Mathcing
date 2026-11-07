@@ -3,12 +3,16 @@
 Both inputs are normalized to the same array of metric line segments.  The
 matcher then projects a predicted position onto every segment and scores the
 candidates using cross-track distance and bidirectional heading agreement.
+The instantaneous score follows the two-term position/heading Mahalanobis
+criterion described by Fouque, Bonnifait, and Betaille (PLANS 2008).  Temporal
+hypotheses are retained conservatively, but this module is not Heirich's RBPF:
+it does not maintain a separate navigation state inside every particle.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -58,6 +62,14 @@ class TrackDatabaseMatcher:
             np.deg2rad(nominal_map_heading_sigma_deg)
         )
         self.ambiguity_score_margin = float(ambiguity_score_margin)
+        if self.maximum_distance_m <= 0.0:
+            raise ValueError("maximum_distance_m must be positive")
+        if self.nominal_map_distance_sigma_m <= 0.0:
+            raise ValueError("nominal_map_distance_sigma_m must be positive")
+        if self.nominal_map_heading_sigma_rad <= 0.0:
+            raise ValueError("nominal_map_heading_sigma_deg must be positive")
+        if self.ambiguity_score_margin < 0.0:
+            raise ValueError("ambiguity_score_margin must be non-negative")
         self._load_segments()
 
     @staticmethod
@@ -197,6 +209,33 @@ class TrackDatabaseMatcher:
         position_covariance_xy: np.ndarray | None = None,
         heading_variance_rad2: float = 0.0,
     ) -> TrackMatch | None:
+        candidates = self.candidates(
+            position_xy,
+            heading_rad,
+            position_covariance_xy=position_covariance_xy,
+            heading_variance_rad2=heading_variance_rad2,
+            maximum_candidates=10,
+        )
+        if not candidates:
+            return None
+        best = candidates[0]
+        ambiguous = any(
+            candidate.way_id != best.way_id
+            and candidate.score - best.score <= self.ambiguity_score_margin
+            for candidate in candidates[1:]
+        )
+        return replace(best, ambiguous=ambiguous)
+
+    def candidates(
+        self,
+        position_xy: np.ndarray,
+        heading_rad: float,
+        *,
+        position_covariance_xy: np.ndarray | None = None,
+        heading_variance_rad2: float = 0.0,
+        maximum_candidates: int = 8,
+    ) -> list[TrackMatch]:
+        """Return ranked segment candidates without collapsing ambiguity."""
         position = np.asarray(position_xy, dtype=np.float64).reshape(2)
         relative = position - self.segment_starts
         fractions = np.einsum("ij,ij->i", relative, self.segment_vectors)
@@ -227,37 +266,164 @@ class TrackDatabaseMatcher:
         )
         scores = distances_squared / distance_variance + heading_errors**2 / heading_variance
         order = np.argsort(scores)
-        best_index = int(order[0])
-        best_distance = float(np.sqrt(distances_squared[best_index]))
-        if best_distance > self.maximum_distance_m:
+        matches: list[TrackMatch] = []
+        for candidate_index_raw in order:
+            candidate_index = int(candidate_index_raw)
+            distance = float(np.sqrt(distances_squared[candidate_index]))
+            if distance > self.maximum_distance_m:
+                continue
+            tangent = self.segment_tangents[candidate_index].copy()
+            if reverse_errors[candidate_index] < forward_errors[candidate_index]:
+                tangent = -tangent
+            normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+            closest = projections[candidate_index].copy()
+            matches.append(
+                TrackMatch(
+                    way_id=int(self.way_ids[candidate_index]),
+                    segment_index=int(self.segment_indices[candidate_index]),
+                    closest_point_xy=closest,
+                    tangent_xy=tangent,
+                    normal_xy=normal,
+                    heading_rad=float(np.arctan2(tangent[1], tangent[0])),
+                    distance_m=distance,
+                    signed_lateral_error_m=float(normal @ (position - closest)),
+                    score=float(scores[candidate_index]),
+                    ambiguous=False,
+                )
+            )
+            if len(matches) >= maximum_candidates:
+                break
+        return matches
+
+
+class TrackHypothesisManager:
+    """Maintain several plausible segment associations through time.
+
+    The same manager configuration is used by every constraint experiment.
+    Ambiguous epochs retain alternatives for the next epoch but do not produce
+    a map update, avoiding a forced correction to one uncertain branch.
+    """
+
+    def __init__(
+        self,
+        matcher: TrackDatabaseMatcher,
+        *,
+        maximum_hypotheses: int = 5,
+        way_change_penalty: float = 4.0,
+        segment_jump_penalty: float = 0.5,
+        ambiguity_margin: float | None = None,
+    ) -> None:
+        self.matcher = matcher
+        self.maximum_hypotheses = int(maximum_hypotheses)
+        self.way_change_penalty = float(way_change_penalty)
+        self.segment_jump_penalty = float(segment_jump_penalty)
+        self.ambiguity_margin = float(
+            matcher.ambiguity_score_margin
+            if ambiguity_margin is None
+            else ambiguity_margin
+        )
+        if self.maximum_hypotheses <= 0:
+            raise ValueError("maximum_hypotheses must be positive")
+        self._hypotheses: list[tuple[TrackMatch, float]] = []
+        self._probabilities = np.empty(0, dtype=np.float64)
+
+    @property
+    def hypothesis_count(self) -> int:
+        return len(self._hypotheses)
+
+    @property
+    def hypotheses(self) -> tuple[TrackMatch, ...]:
+        """Retained alternatives in descending posterior plausibility."""
+        return tuple(match for match, _cost in self._hypotheses)
+
+    @property
+    def hypothesis_probabilities(self) -> np.ndarray:
+        """Normalized score-derived probabilities for diagnostics.
+
+        These values summarize the association cost and transition penalties;
+        they are not particle-filter posterior weights.
+        """
+        return self._probabilities.copy()
+
+    @property
+    def best_probability(self) -> float:
+        return float(self._probabilities[0]) if len(self._probabilities) else 0.0
+
+    @property
+    def effective_hypothesis_count(self) -> float:
+        if not len(self._probabilities):
+            return 0.0
+        return float(1.0 / np.sum(self._probabilities**2))
+
+    @property
+    def hypothesis_entropy(self) -> float:
+        if not len(self._probabilities):
+            return 0.0
+        probabilities = self._probabilities[self._probabilities > 0.0]
+        return float(-np.sum(probabilities * np.log(probabilities)))
+
+    def reset(self) -> None:
+        self._hypotheses.clear()
+        self._probabilities = np.empty(0, dtype=np.float64)
+
+    def update(
+        self,
+        position_xy: np.ndarray,
+        heading_rad: float,
+        *,
+        position_covariance_xy: np.ndarray | None = None,
+        heading_variance_rad2: float = 0.0,
+    ) -> TrackMatch | None:
+        candidates = self.matcher.candidates(
+            position_xy,
+            heading_rad,
+            position_covariance_xy=position_covariance_xy,
+            heading_variance_rad2=heading_variance_rad2,
+            maximum_candidates=max(8, 2 * self.maximum_hypotheses),
+        )
+        if not candidates:
+            self.reset()
             return None
 
-        tangent = self.segment_tangents[best_index].copy()
-        if reverse_errors[best_index] < forward_errors[best_index]:
-            tangent = -tangent
-        normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
-        closest = projections[best_index].copy()
-        lateral_error = float(normal @ (position - closest))
+        scored: list[tuple[TrackMatch, float]] = []
+        if not self._hypotheses:
+            scored = [(candidate, candidate.score) for candidate in candidates]
+        else:
+            for candidate in candidates:
+                transition_costs = []
+                for previous, previous_cost in self._hypotheses:
+                    if candidate.way_id == previous.way_id:
+                        jump = max(
+                            0,
+                            abs(candidate.segment_index - previous.segment_index) - 2,
+                        )
+                        penalty = self.segment_jump_penalty * jump
+                    else:
+                        penalty = self.way_change_penalty
+                    transition_costs.append(previous_cost + penalty)
+                scored.append((candidate, candidate.score + min(transition_costs)))
 
-        ambiguous = False
-        best_way = int(self.way_ids[best_index])
-        for candidate_index_raw in order[1:10]:
-            candidate_index = int(candidate_index_raw)
-            if int(self.way_ids[candidate_index]) == best_way:
-                continue
-            if scores[candidate_index] - scores[best_index] <= self.ambiguity_score_margin:
-                ambiguous = True
-            break
-
-        return TrackMatch(
-            way_id=best_way,
-            segment_index=int(self.segment_indices[best_index]),
-            closest_point_xy=closest,
-            tangent_xy=tangent,
-            normal_xy=normal,
-            heading_rad=float(np.arctan2(tangent[1], tangent[0])),
-            distance_m=best_distance,
-            signed_lateral_error_m=lateral_error,
-            score=float(scores[best_index]),
-            ambiguous=ambiguous,
+        scored.sort(key=lambda item: item[1])
+        best_cost = scored[0][1]
+        # Renormalization prevents cumulative values from growing indefinitely.
+        self._hypotheses = [
+            (match, cost - best_cost)
+            for match, cost in scored[: self.maximum_hypotheses]
+        ]
+        normalized_costs = np.asarray(
+            [cost for _match, cost in self._hypotheses], dtype=np.float64
         )
+        likelihoods = np.exp(-0.5 * normalized_costs)
+        likelihood_sum = float(np.sum(likelihoods))
+        self._probabilities = (
+            likelihoods / likelihood_sum
+            if likelihood_sum > 0.0 and np.isfinite(likelihood_sum)
+            else np.full(len(likelihoods), 1.0 / len(likelihoods))
+        )
+        best, normalized_best = self._hypotheses[0]
+        ambiguous = any(
+            candidate.way_id != best.way_id
+            and cost - normalized_best <= self.ambiguity_margin
+            for candidate, cost in self._hypotheses[1:]
+        )
+        return replace(best, ambiguous=ambiguous)

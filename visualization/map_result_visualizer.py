@@ -13,15 +13,15 @@ from map_matching.algorithms.map_track_matcher import TrackDatabaseMatcher
 
 
 MODE_COLORS = {
-    "raw_gnss": "#cc3311",
-    "imu_only": "#7f7f7f",
-    "gnss_imu": "#1f77b4",
-    "two_step": "#ff7f0e",
-    "one_step_heading": "#2ca02c",
-    "one_step_lateral": "#d62728",
-    "one_step_pose": "#9467bd",
-    "one_step_orthophoto_boundary": "#00a6a6",
-    "one_step_osm_orthophoto": "#cc79a7",
+    # Okabe-Ito-inspired, color-blind-safe palette.  In particular, the
+    # two-step output and line-normal update no longer use orange/red hues
+    # that are difficult to distinguish in dense comparison figures.
+    "raw_gnss": "#6b6b6b",
+    "gnss_imu": "#0072b2",
+    "two_step": "#e69f00",
+    "one_step_map_heading": "#009e73",
+    "one_step_cross_track": "#cc79a7",
+    "one_step_combined": "#6a3d9a",
 }
 
 
@@ -71,7 +71,7 @@ def add_map_background(
     raw = np.asarray(raw_gnss_xy, dtype=np.float64)
     axis.plot(
         raw[:, 0], raw[:, 1], color="#cc3311", linewidth=1.0,
-        alpha=0.75, label="Raw GNSS", zorder=3,
+        alpha=0.75, label="Recorded GNSS positions (unfiltered)", zorder=3,
     )
     margin = 75.0
     axis.set_xlim(float(np.min(raw[:, 0]) - margin), float(np.max(raw[:, 0]) + margin))
@@ -214,7 +214,10 @@ def plot_mode_comparison(
     raw_distances = reference.distances(raw_positions)
     raw_stats = DistanceStatistics.from_distances(raw_distances[common_mask])
     statistics["raw_gnss"] = raw_stats
-    raw_label = f"raw GNSS (RMSE {raw_stats.rmse_m:.2f} m)"
+    raw_label = (
+        "recorded GNSS positions, unfiltered "
+        f"(RMSE {raw_stats.rmse_m:.2f} m)"
+    )
     distance_axis.plot(
         relative_time,
         raw_distances,

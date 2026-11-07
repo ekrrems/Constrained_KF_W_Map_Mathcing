@@ -8,8 +8,10 @@ to the GNSS timestamp before applying the GNSS measurement update.
 
 The supplied six-value ``sensor.Data.Bias`` vector is interpreted as
 ``[accelerometer xyz, gyroscope xyz]``.  Bias correction is enabled by default.
-Axis signs remain opt-in because the ESIKF uses a positive-up body convention
-whereas the MATLAB metadata describes the original sensor mounting convention.
+The supplied axis signs map the source measurements to the professor code's
+forward-right-down body convention.  They must only be enabled together with a
+filter initialized in that convention; the alternative raw convention is
+forward-left-up.
 """
 
 from __future__ import annotations
@@ -51,7 +53,16 @@ class GnssReading:
     position_utm_m: np.ndarray
     position_local_m: np.ndarray
     mode: int
-    covariance_m2: np.ndarray
+    position_covariance_m2: np.ndarray
+    velocity_utm_mps: np.ndarray
+    velocity_covariance_m2ps2: np.ndarray
+    position_velocity_cross_covariance: np.ndarray
+    velocity_valid: bool
+
+    @property
+    def covariance_m2(self) -> np.ndarray:
+        """Compatibility name for position covariance."""
+        return self.position_covariance_m2
 
 
 @dataclass(frozen=True)
@@ -157,8 +168,15 @@ class MatlabDataObtainer:
         record_set: int,
         *,
         gyro_input_unit: str = "deg/s",
-        horizontal_gnss_std_m: float = 1.5,
+        horizontal_gnss_std_m: float = 5.0,
         vertical_gnss_std_m: float = 3.0,
+        fixed_rtk_horizontal_std_m: float = 0.10,
+        float_rtk_horizontal_std_m: float = 0.50,
+        fixed_rtk_mode: int = 4,
+        float_rtk_mode: int = 5,
+        gnss_velocity_window: int = 5,
+        gnss_velocity_method: str = "none",
+        gnss_outages_s: tuple[tuple[float, float], ...] = (),
         interpolate_imu_at_gnss: bool = True,
         apply_supplied_bias: bool = True,
         apply_axis_orientation: bool = False,
@@ -169,7 +187,27 @@ class MatlabDataObtainer:
         self.gyro_input_unit = gyro_input_unit
         self.horizontal_gnss_std_m = float(horizontal_gnss_std_m)
         self.vertical_gnss_std_m = float(vertical_gnss_std_m)
+        self.fixed_rtk_horizontal_std_m = float(fixed_rtk_horizontal_std_m)
+        self.float_rtk_horizontal_std_m = float(float_rtk_horizontal_std_m)
+        self.fixed_rtk_mode = int(fixed_rtk_mode)
+        self.float_rtk_mode = int(float_rtk_mode)
+        if self.fixed_rtk_mode == self.float_rtk_mode:
+            raise ValueError("fixed_rtk_mode and float_rtk_mode must differ")
+        self.gnss_velocity_window = int(gnss_velocity_window)
+        if self.gnss_velocity_window < 2:
+            raise ValueError("gnss_velocity_window must be at least 2")
+        if gnss_velocity_method not in ("none", "professor_difference", "regression"):
+            raise ValueError(
+                "gnss_velocity_method must be 'none', 'professor_difference', "
+                "or 'regression'"
+            )
+        self.gnss_velocity_method = gnss_velocity_method
         self.interpolate_imu_at_gnss = bool(interpolate_imu_at_gnss)
+        self.gnss_outages_s = tuple(
+            (float(start), float(end)) for start, end in gnss_outages_s
+        )
+        if any(end <= start for start, end in self.gnss_outages_s):
+            raise ValueError("Every GNSS outage must satisfy end > start")
         self.apply_supplied_bias = bool(apply_supplied_bias)
         self.apply_axis_orientation = bool(apply_axis_orientation)
 
@@ -287,7 +325,12 @@ class MatlabDataObtainer:
         self.gnss_latitude_deg = position[:, 1].copy()
         self.gnss_longitude_deg = position[:, 2].copy()
         self.gnss_altitude_m = position[:, 3].copy()
-        self.gnss_mode = mode
+        self.gnss_mode_recorded = mode.copy()
+        self.gnss_mode = mode.copy()
+        relative_gnss_time = self.gnss_timestamps - self.gnss_timestamps[0]
+        for start, end in self.gnss_outages_s:
+            withheld = (relative_gnss_time >= start) & (relative_gnss_time <= end)
+            self.gnss_mode[withheld] = -1
 
         east, north, zone = latlon_to_utm(
             self.gnss_latitude_deg,
@@ -301,13 +344,25 @@ class MatlabDataObtainer:
             self.gnss_positions_utm_m - self.local_origin_utm_m
         )
 
-        self.gnss_covariance_m2 = np.diag(
-            [
-                self.horizontal_gnss_std_m**2,
-                self.horizontal_gnss_std_m**2,
-                self.vertical_gnss_std_m**2,
-            ]
+        # Interpret the numeric quality codes using the conventional GNSS fix
+        # mapping (4: RTK fixed, 5: RTK float). Confirm this mapping against the
+        # Intermetric export documentation before final thesis reporting.
+        # Unknown/standalone modes retain the conservative 5 m fallback used in
+        # the Frolow, Zhang, and Schwieger (2026) stochastic-model comparison.
+        horizontal_std = np.full(len(mode), self.horizontal_gnss_std_m)
+        horizontal_std[mode == self.fixed_rtk_mode] = (
+            self.fixed_rtk_horizontal_std_m
         )
+        horizontal_std[mode == self.float_rtk_mode] = (
+            self.float_rtk_horizontal_std_m
+        )
+        vertical_std = np.maximum(horizontal_std * 2.0, self.vertical_gnss_std_m)
+        self.gnss_position_covariances_m2 = np.zeros((len(mode), 3, 3))
+        self.gnss_position_covariances_m2[:, 0, 0] = horizontal_std**2
+        self.gnss_position_covariances_m2[:, 1, 1] = horizontal_std**2
+        self.gnss_position_covariances_m2[:, 2, 2] = vertical_std**2
+        self.gnss_horizontal_std_m = horizontal_std
+        self._derive_gnss_velocity()
         self.imu_metadata = ImuMetadata(
             sampling_rate_hz=float(imu_sensor["SamplingRate"]),
             axis_orientation=axis_orientation.astype(np.int64, copy=True),
@@ -320,6 +375,88 @@ class MatlabDataObtainer:
             utm_zone=zone,
             local_origin_utm_m=self.local_origin_utm_m.copy(),
         )
+
+    def _derive_gnss_velocity(self) -> None:
+        if self.gnss_velocity_method == "none":
+            count = len(self.gnss_timestamps)
+            self.gnss_velocities_utm_mps = np.full((count, 3), np.nan)
+            self.gnss_velocity_covariances_m2ps2 = np.full((count, 3, 3), np.nan)
+            self.gnss_position_velocity_cross_covariances = np.full(
+                (count, 3, 3), np.nan
+            )
+            self.gnss_velocity_valid = np.zeros(count, dtype=bool)
+            return
+        if self.gnss_velocity_method == "professor_difference":
+            self._derive_professor_difference_velocity()
+            return
+        self._derive_causal_regression_velocity()
+
+    def _derive_professor_difference_velocity(self) -> None:
+        """Reproduce the professor code's consecutive-position velocity.
+
+        The MATLAB implementation uses ``diff(GNSS_XYZ)`` at nominally 1 Hz
+        and assigns velocity the same mode-dependent standard deviation as
+        position.  Division by the measured time interval is retained here so
+        that units remain correct when timestamps are not exactly one second
+        apart.  This is a reproduction ablation, not the statistically
+        preferred thesis baseline: successive differences reuse positions and
+        therefore have temporally correlated errors.
+        """
+        count = len(self.gnss_timestamps)
+        self.gnss_velocities_utm_mps = np.full((count, 3), np.nan)
+        self.gnss_velocity_covariances_m2ps2 = np.full((count, 3, 3), np.nan)
+        self.gnss_position_velocity_cross_covariances = np.zeros(
+            (count, 3, 3), dtype=np.float64
+        )
+        self.gnss_velocity_valid = np.zeros(count, dtype=bool)
+        intervals = np.diff(self.gnss_timestamps)
+        valid = intervals > 0.0
+        differences = np.diff(self.gnss_positions_utm_m, axis=0)
+        self.gnss_velocities_utm_mps[1:][valid] = (
+            differences[valid] / intervals[valid, None]
+        )
+        # Match the supplied MATLAB stochastic model deliberately.  The zero
+        # same-epoch cross block and temporal independence are assumptions of
+        # that implementation and are evaluated through NIS diagnostics.
+        self.gnss_velocity_covariances_m2ps2[1:][valid] = (
+            self.gnss_position_covariances_m2[1:][valid]
+        )
+        self.gnss_velocity_valid[1:] = valid
+
+    def _derive_causal_regression_velocity(self) -> None:
+        """Fit velocity from the current and preceding GNSS positions only.
+
+        A short linear regression is causal, so no future position leaks into
+        an online update.  Covariances and the current position/velocity cross
+        covariance follow from the regression weights under independent GNSS
+        position errors.
+        """
+        count = len(self.gnss_timestamps)
+        self.gnss_velocities_utm_mps = np.full((count, 3), np.nan)
+        self.gnss_velocity_covariances_m2ps2 = np.full((count, 3, 3), np.nan)
+        self.gnss_position_velocity_cross_covariances = np.full(
+            (count, 3, 3), np.nan
+        )
+        self.gnss_velocity_valid = np.zeros(count, dtype=bool)
+        for index in range(1, count):
+            start = max(0, index + 1 - self.gnss_velocity_window)
+            times = self.gnss_timestamps[start : index + 1]
+            centered = times - np.mean(times)
+            denominator = float(centered @ centered)
+            if denominator <= 0.0:
+                continue
+            weights = centered / denominator
+            positions = self.gnss_positions_utm_m[start : index + 1]
+            self.gnss_velocities_utm_mps[index] = weights @ positions
+            covariances = self.gnss_position_covariances_m2[start : index + 1]
+            velocity_covariance = np.zeros((3, 3), dtype=np.float64)
+            for weight, covariance in zip(weights, covariances):
+                velocity_covariance += weight**2 * covariance
+            self.gnss_velocity_covariances_m2ps2[index] = velocity_covariance
+            self.gnss_position_velocity_cross_covariances[index] = (
+                weights[-1] * covariances[-1]
+            )
+            self.gnss_velocity_valid[index] = True
 
     def __len__(self) -> int:
         return len(self.imu_timestamps) + len(self.gnss_timestamps)
@@ -341,7 +478,15 @@ class MatlabDataObtainer:
             position_utm_m=self.gnss_positions_utm_m[index].copy(),
             position_local_m=self.gnss_positions_local_m[index].copy(),
             mode=int(self.gnss_mode[index]),
-            covariance_m2=self.gnss_covariance_m2.copy(),
+            position_covariance_m2=self.gnss_position_covariances_m2[index].copy(),
+            velocity_utm_mps=self.gnss_velocities_utm_mps[index].copy(),
+            velocity_covariance_m2ps2=(
+                self.gnss_velocity_covariances_m2ps2[index].copy()
+            ),
+            position_velocity_cross_covariance=(
+                self.gnss_position_velocity_cross_covariances[index].copy()
+            ),
+            velocity_valid=bool(self.gnss_velocity_valid[index]),
         )
 
     def _interpolated_imu(self, timestamp: float, left: int, right: int) -> ImuReading:
