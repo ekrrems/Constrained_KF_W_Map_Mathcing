@@ -298,7 +298,11 @@ class KittiRawDataObtainer:
             )
             if end_index - start_index < 2:
                 raise ValueError(
-                    "The 100 Hz extract IMU does not overlap the selected sync frames"
+                    "The 100 Hz extract IMU does not overlap the selected sync "
+                    f"frames. Selected sync interval: {absolute_times[0]} to "
+                    f"{absolute_times[-1]}; extract interval: "
+                    f"{all_imu_absolute_times[0]} to "
+                    f"{all_imu_absolute_times[-1]}"
                 )
             self.imu_frame_indices = np.arange(
                 start_index, end_index, dtype=np.int64

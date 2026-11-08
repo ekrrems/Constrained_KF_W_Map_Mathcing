@@ -344,11 +344,10 @@ class MatlabDataObtainer:
             self.gnss_positions_utm_m - self.local_origin_utm_m
         )
 
-        # Interpret the numeric quality codes using the conventional GNSS fix
-        # mapping (4: RTK fixed, 5: RTK float). Confirm this mapping against the
-        # Intermetric export documentation before final thesis reporting.
-        # Unknown/standalone modes retain the conservative 5 m fallback used in
-        # the Frolow, Zhang, and Schwieger (2026) stochastic-model comparison.
+        # Match the supplied IIGS MATLAB reference implementation: mode 4 is
+        # RTK fixed with 0.10 m horizontal standard deviation and mode 5 is
+        # RTK float with 0.50 m. Unknown modes retain the configured
+        # conservative fallback rather than inheriting the preceding epoch.
         horizontal_std = np.full(len(mode), self.horizontal_gnss_std_m)
         horizontal_std[mode == self.fixed_rtk_mode] = (
             self.fixed_rtk_horizontal_std_m

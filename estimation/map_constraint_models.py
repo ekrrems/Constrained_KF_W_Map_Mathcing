@@ -2,8 +2,9 @@
 
 The heading observation follows the map-aided heading concept of Fouque,
 Bonnifait, and Betaille (IEEE/ION PLANS 2008).  The coordinate observation is
-the standard line-normal pseudo-measurement: the signed perpendicular distance
-from the estimated horizontal position to the associated map segment should be
+the line-normal limit of the anisotropic map observation described by El
+Najjar and Bonnifait (Autonomous Robots, 2005): uncertainty along the segment
+is left unconstrained while the signed perpendicular distance is observed as
 zero.  The stacked coordinate/heading observation is a thesis experiment and
 is not attributed to either source as a complete published algorithm.
 """
@@ -57,7 +58,7 @@ def speed_dependent_heading_std_rad(
     minimum_std_rad: float = np.deg2rad(3.0),
     reference_speed_mps: float = 20.0,
 ) -> float:
-    """Fouque-style map-heading uncertainty decreasing toward ``sigma_0``.
+    """Fouque et al. map-heading uncertainty decreasing toward ``sigma_0``.
 
     At standstill the map tangent is not a useful vehicle-heading observation,
     so its standard deviation approaches pi/2.  It decreases linearly to the
@@ -71,7 +72,7 @@ def speed_dependent_heading_std_rad(
 
 
 class MapHeadingObservation:
-    """Fouque-style directed segment-heading pseudo-measurement."""
+    """Directed segment-heading pseudo-measurement after Fouque et al."""
     def __init__(
         self,
         *,
@@ -118,7 +119,12 @@ class MapHeadingObservation:
 
 
 class CrossTrackPositionConstraint:
-    """Line-normal coordinate pseudo-measurement ``n.T @ (p - q) = 0``."""
+    """Line-normal map observation ``n.T @ (p - q) = 0``.
+
+    This is equivalent to the straight-segment observation of El Najjar and
+    Bonnifait when the along-segment variance tends to infinity.  It does not
+    claim to reproduce their Belief-Theory association or map-bias states.
+    """
     def __init__(self, *, lateral_std_m: float = 2.0) -> None:
         if lateral_std_m <= 0.0:
             raise ValueError("lateral_std_m must be positive")

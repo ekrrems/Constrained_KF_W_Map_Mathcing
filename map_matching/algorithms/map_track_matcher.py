@@ -196,6 +196,12 @@ class TrackDatabaseMatcher:
         self.segment_tangents = self.segment_vectors / lengths[:, None]
         self.way_ids = np.asarray(way_ids, dtype=np.int64)
         self.segment_indices = np.asarray(segment_indices, dtype=np.int64)
+        self._segment_lookup = {
+            (int(way_id), int(segment_index)): array_index
+            for array_index, (way_id, segment_index) in enumerate(
+                zip(self.way_ids, self.segment_indices)
+            )
+        }
 
     @property
     def segment_count(self) -> int:
@@ -225,6 +231,48 @@ class TrackDatabaseMatcher:
             for candidate in candidates[1:]
         )
         return replace(best, ambiguous=ambiguous)
+
+    def reproject_fixed_segment(
+        self,
+        template: TrackMatch,
+        position_xy: np.ndarray,
+    ) -> TrackMatch:
+        """Recompute geometry on a scheduled segment for the current state.
+
+        A fixed-association experiment freezes the discrete segment identity,
+        not the continuous closest point or residual produced by the baseline
+        trajectory. Reusing the baseline residual would apply the wrong
+        measurement once another estimator departs from that trajectory.
+        """
+        key = (int(template.way_id), int(template.segment_index))
+        if key not in self._segment_lookup:
+            raise KeyError(f"Scheduled map segment is unavailable: {key}")
+        array_index = self._segment_lookup[key]
+        position = np.asarray(position_xy, dtype=np.float64).reshape(2)
+        start = self.segment_starts[array_index]
+        vector = self.segment_vectors[array_index]
+        fraction = float(
+            np.clip(
+                (position - start) @ vector
+                / self.segment_lengths_squared[array_index],
+                0.0,
+                1.0,
+            )
+        )
+        closest = start + fraction * vector
+        tangent = np.asarray(template.tangent_xy, dtype=np.float64).reshape(2)
+        tangent /= np.linalg.norm(tangent)
+        normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+        residual = position - closest
+        return replace(
+            template,
+            closest_point_xy=closest,
+            tangent_xy=tangent,
+            normal_xy=normal,
+            heading_rad=float(np.arctan2(tangent[1], tangent[0])),
+            distance_m=float(np.linalg.norm(residual)),
+            signed_lateral_error_m=float(normal @ residual),
+        )
 
     def candidates(
         self,

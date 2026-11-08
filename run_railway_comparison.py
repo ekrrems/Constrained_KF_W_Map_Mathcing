@@ -24,7 +24,7 @@ from estimation.map_reference_evaluation import (
 from map_matching.algorithms.map_track_matcher import TrackDatabaseMatcher
 from sensors.map_matlab_data_obtainer import MatlabDataObtainer
 from sensors.map_show_dataset_map import read_reference_nodes
-from src.map_matlab_main import (
+from src.experiment_engine import (
     DATA_FOLDER, RECORDING_DATE, RECORD_SET, find_reference_file, find_unique,
     run_experiment,
 )
@@ -32,6 +32,7 @@ from visualization.experiment_diagnostics import (
     MODE_TITLES, plot_dataset_comparison, plot_mode_diagnostics,
 )
 from visualization.thesis_story_plots import save_thesis_story_figures
+from visualization.route_quality_report import save_route_quality_report
 
 
 DEFAULT_MODES = (
@@ -85,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--modes", nargs="+", choices=DEFAULT_MODES)
     parser.add_argument("--state-crs", default="EPSG:32632")
-    parser.add_argument("--map-lateral-std", type=float, default=2.0)
+    parser.add_argument("--map-lateral-std", type=float, default=0.35)
     parser.add_argument("--map-heading-min-std-deg", type=float, default=3.0)
     parser.add_argument("--map-heading-reference-speed", type=float, default=20.0)
     parser.add_argument("--map-heading-min-speed", type=float, default=1.0)
@@ -162,11 +163,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also create dense engineering diagnostics; clear figures are the default.",
     )
     parser.add_argument(
-        "--output", type=Path, default=Path("outputs/matlab_comparison")
+        "--output", type=Path, default=Path("outputs/railway_comparison")
     )
     parser.add_argument(
         "--show", action=argparse.BooleanOptionalAction, default=True,
         help="Open diagnostic figures; use --no-show for a batch run.",
+    )
+    parser.add_argument(
+        "--route-window-duration", type=float, default=20.0,
+        help="Duration of every automatic complete-route analysis window [s].",
+    )
+    parser.add_argument(
+        "--route-window-step", type=float, default=5.0,
+        help="Step between automatic complete-route analysis windows [s].",
     )
     return parser
 
@@ -451,10 +460,28 @@ def main() -> None:
         gnss_available=gnss_available,
         evaluation_mask=evaluation_mask,
         output_directory=arguments.output / "clear_figures",
-        dataset_title=(
-            f"Intermetric railway data — {arguments.recording_date}, "
-            f"set {arguments.record_set}"
-        ),
+        dataset_title="Railway dataset",
+    )
+    reference_at_epochs = np.asarray([
+        reference.closest_point_and_distance(point)[0]
+        for point in raw_xy
+    ])
+    route_paths = save_route_quality_report(
+        results=results,
+        errors_by_mode=errors_by_mode,
+        raw_xy=raw_xy,
+        raw_errors_m=raw_errors,
+        reference_at_epochs=reference_at_epochs,
+        reference_geometry=reference_points,
+        timestamps=data.gnss_timestamps,
+        gnss_available=gnss_available,
+        evaluation_mask=evaluation_mask,
+        output_directory=arguments.output / "route_quality",
+        dataset_title="Railway dataset",
+        state_crs=arguments.state_crs,
+        error_metric_label="Distance to railway reference",
+        window_duration_s=arguments.route_window_duration,
+        window_step_s=arguments.route_window_step,
     )
     print("\nCommon-reference RMSE")
     print(
@@ -491,6 +518,7 @@ def main() -> None:
         print(f"\nDetailed comparison: {comparison_path.resolve()}")
     print(f"All diagnostics:   {arguments.output.resolve()}")
     print(f"Clear figures:     {clear_paths[0].parent.resolve()}")
+    print(f"Route-wide report: {route_paths[2].parent.resolve()}")
 
 
 if __name__ == "__main__":

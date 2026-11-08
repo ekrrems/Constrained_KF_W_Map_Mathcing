@@ -26,17 +26,19 @@ from estimation.railway_state import (
     VEL,
 )
 from geometry.quaternion import (
+    quaternion_multiply,
     quaternion_to_rotation_matrix,
     rotation_vector_to_quaternion,
 )
 from map_matching.algorithms.map_track_matcher import (
     TrackDatabaseMatcher,
     TrackHypothesisManager,
+    TrackMatch,
 )
 from sensors.map_matlab_data_obtainer import GnssReading, ImuReading
 from sensors.kitti_raw_data import KittiRawDataObtainer
 from sensors.map_show_dataset_map import read_reference_nodes
-from src.map_matlab_main import run_experiment
+from src.experiment_engine import run_experiment
 
 
 def make_track_database(path, ways=None) -> None:
@@ -79,6 +81,28 @@ def test_constraint_names_and_18d_shapes(tmp_path) -> None:
     assert np.isclose(
         speed_dependent_heading_std_rad(20.0), np.deg2rad(3.0)
     )
+    assert np.isclose(
+        speed_dependent_heading_std_rad(10.0),
+        0.5 * (np.pi / 2.0 + np.deg2rad(3.0)),
+    )
+
+
+def test_fixed_association_recomputes_current_state_residual(tmp_path) -> None:
+    database_path = tmp_path / "track.db"
+    make_track_database(database_path)
+    matcher = TrackDatabaseMatcher(database_path)
+    template = matcher.match(np.array([10.0, 2.0]), 0.0)
+    assert template is not None
+    assert np.isclose(template.signed_lateral_error_m, 2.0)
+
+    current = matcher.reproject_fixed_segment(
+        template,
+        np.array([25.0, -3.0]),
+    )
+    assert current.way_id == template.way_id
+    assert current.segment_index == template.segment_index
+    assert np.allclose(current.closest_point_xy, [25.0, 0.0])
+    assert np.isclose(current.signed_lateral_error_m, -3.0)
 
 
 def test_map_yaw_jacobian_matches_right_quaternion_error() -> None:
@@ -95,6 +119,77 @@ def test_map_yaw_jacobian_matches_right_quaternion_error() -> None:
         [0.0, np.sin(roll), np.cos(roll)],
         atol=1.0e-7,
     )
+
+
+def test_map_constraint_jacobians_by_finite_difference() -> None:
+    """Check the actual map residuals, not only the quaternion helper."""
+    epsilon = 1.0e-7
+    eskf = GnssImuESKF.__new__(GnssImuESKF)
+    eskf.state = RailwayESKFState(
+        quaternion_wb=rotation_vector_to_quaternion(
+            np.array([0.25, -0.12, 0.40])
+        ),
+        position_wb=np.array([12.0, 3.0, 1.0]),
+        velocity_wb=np.array([8.0, 1.0, 0.0]),
+    )
+    match = TrackMatch(
+        way_id=1,
+        segment_index=2,
+        closest_point_xy=np.array([11.0, 1.0]),
+        tangent_xy=np.array([0.8, 0.6]),
+        normal_xy=np.array([-0.6, 0.8]),
+        heading_rad=float(np.arctan2(0.6, 0.8)),
+        distance_m=1.0,
+        signed_lateral_error_m=float(
+            np.array([-0.6, 0.8]) @ (np.array([12.0, 3.0]) - np.array([11.0, 1.0]))
+        ),
+        score=0.0,
+        ambiguous=False,
+    )
+    heading_jacobian = eskf.yaw_error_jacobian()
+    heading = MapHeadingObservation().linearize(
+        match,
+        predicted_heading_rad=eskf.quaternion_to_yaw_rad(),
+        speed_mps=8.0,
+        heading_error_jacobian=heading_jacobian,
+    )
+    lateral = CrossTrackPositionConstraint().linearize(match)
+    combined = CombinedCrossTrackHeadingConstraint().linearize(
+        match,
+        predicted_heading_rad=eskf.quaternion_to_yaw_rad(),
+        speed_mps=8.0,
+        heading_error_jacobian=heading_jacobian,
+    )
+
+    base_position = eskf.state.position_wb.copy()
+    base_quaternion = eskf.state.quaternion_wb.copy()
+
+    def predicted_observation(error_state: np.ndarray) -> np.ndarray:
+        position = base_position + error_state[POS]
+        perturbed = quaternion_multiply(
+            base_quaternion,
+            rotation_vector_to_quaternion(error_state[ROT]),
+        )
+        rotation = quaternion_to_rotation_matrix(perturbed)
+        yaw = float(np.arctan2(rotation[1, 0], rotation[0, 0]))
+        lateral_value = float(
+            match.normal_xy @ (position[:2] - match.closest_point_xy)
+        )
+        return np.array([lateral_value, yaw])
+
+    numerical = np.empty((2, STATE_DIM))
+    for column in range(STATE_DIM):
+        delta = np.zeros(STATE_DIM)
+        delta[column] = epsilon
+        plus = predicted_observation(delta)
+        minus = predicted_observation(-delta)
+        difference = plus - minus
+        difference[1] = np.arctan2(np.sin(difference[1]), np.cos(difference[1]))
+        numerical[:, column] = difference / (2.0 * epsilon)
+
+    assert np.allclose(lateral.jacobian, numerical[[0]], atol=1.0e-7)
+    assert np.allclose(heading.jacobian, numerical[[1]], atol=1.0e-7)
+    assert np.allclose(combined.jacobian, numerical, atol=1.0e-7)
 
 
 def test_propagation_acceleration_jacobians_by_finite_difference() -> None:

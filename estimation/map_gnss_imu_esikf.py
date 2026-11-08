@@ -100,8 +100,9 @@ class GnssImuESKF:
             raise ValueError("gnss_dimensions must be 2 or 3")
         self.gnss_dimensions = int(gnss_dimensions)
         self.use_gnss_velocity = bool(use_gnss_velocity)
-        # Horizontal-only GNSS is the default.  The supplied GNSS altitude is
-        # much noisier and should not destabilize the planar train baseline.
+        # This class supports horizontal or three-dimensional GNSS.  The
+        # railway comparison runner currently selects 3-D by default and uses
+        # a separate, larger vertical covariance.
         default_threshold = 9.210340371976184 if gnss_dimensions == 2 else 11.344866730144373
         self.gnss_nis_threshold = float(
             default_threshold if gnss_nis_threshold is None else gnss_nis_threshold

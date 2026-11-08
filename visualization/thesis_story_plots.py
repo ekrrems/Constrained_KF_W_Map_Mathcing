@@ -365,32 +365,125 @@ def save_thesis_story_figures(
         "gnss_imu", "two_step", "one_step_map_heading",
         "one_step_cross_track", "one_step_combined",
     ) if mode in errors_by_mode]
-    values = [
+    rmse_values = [
         _rmse(np.asarray(raw_errors_m)[evaluated])
         if mode == "raw_gnss"
         else _rmse(np.asarray(errors_by_mode[mode])[evaluated])
+        for mode in modes
+    ]
+    mean_values = [
+        float(np.mean(np.asarray(raw_errors_m)[evaluated]))
+        if mode == "raw_gnss"
+        else float(np.mean(np.asarray(errors_by_mode[mode])[evaluated]))
         for mode in modes
     ]
     colors = [MODE_COLORS[mode] for mode in modes]
     figure_height = max(4.0, 0.72 * len(modes) + 1.5)
     figure, axis = plt.subplots(figsize=(10.0, figure_height), constrained_layout=True)
     y = np.arange(len(modes))
-    bars = axis.barh(y, values, color=colors, height=0.58)
+    for ordinate, mean_value, rmse_value, color in zip(
+        y, mean_values, rmse_values, colors
+    ):
+        axis.hlines(
+            ordinate, mean_value, rmse_value,
+            color=color, linewidth=3.0, alpha=0.72,
+        )
+        axis.scatter(
+            mean_value, ordinate, marker="o", s=58,
+            color=color, edgecolor="white", linewidth=0.7, zorder=3,
+        )
+        axis.scatter(
+            rmse_value, ordinate, marker="D", s=58,
+            facecolor="white", edgecolor=color, linewidth=1.8, zorder=3,
+        )
     axis.set_yticks(y, [MODE_LABELS.get(mode, mode) for mode in modes])
     axis.invert_yaxis()
-    axis.set_xlabel("Horizontal RMSE to evaluation reference [m]")
-    axis.set_title(f"{dataset_title}\nMethod summary")
+    axis.set_xlabel("Horizontal distance to evaluation reference [m]")
+    axis.set_title(f"{dataset_title}\nMean error and RMSE by method")
     axis.grid(True, axis="x", color="#dddddd", linewidth=0.6)
-    maximum = max(values) if values else 1.0
-    axis.set_xlim(0.0, maximum * 1.20)
-    for bar, value in zip(bars, values):
+    maximum = max(rmse_values) if rmse_values else 1.0
+    axis.set_xlim(0.0, maximum * 1.55)
+    baseline_value = (
+        rmse_values[modes.index("gnss_imu")] if "gnss_imu" in modes else np.nan
+    )
+    for ordinate, mode, mean_value, rmse_value in zip(
+        y, modes, mean_values, rmse_values
+    ):
+        if mode.startswith("one_step_") and np.isfinite(baseline_value):
+            delta_mm = 1000.0 * (rmse_value - baseline_value)
+            if abs(delta_mm) < 0.05:
+                delta_mm = 0.0
+            label = (
+                f"{mean_value:.4f} / {rmse_value:.4f} m "
+                f"(RMSE change {delta_mm:+.1f} mm)"
+            )
+        else:
+            label = f"{mean_value:.4f} / {rmse_value:.4f} m"
         axis.text(
-            value + maximum * 0.02,
-            bar.get_y() + bar.get_height() / 2,
-            f"{value:.2f} m",
+            rmse_value + maximum * 0.02,
+            ordinate,
+            label,
             va="center",
         )
+    axis.scatter([], [], marker="o", s=58, color="#555555", label="Mean absolute error")
+    axis.scatter(
+        [], [], marker="D", s=58, facecolor="white", edgecolor="#555555",
+        linewidth=1.8, label="RMSE",
+    )
+    axis.legend(loc="upper right", frameon=False, title="Mean / RMSE")
     figure.savefig(summary_path, dpi=220)
     plt.close(figure)
     generated_paths.insert(2, summary_path)
+
+    direct_modes = [
+        mode for mode in (
+            "one_step_map_heading",
+            "one_step_cross_track",
+            "one_step_combined",
+        )
+        if mode in results and mode in errors_by_mode
+    ]
+    if baseline is not None and direct_modes:
+        effect_path = output_directory / "04_constraint_effect_vs_baseline.png"
+        figure, axes = plt.subplots(
+            2, 1, figsize=(12.0, 7.0), sharex=True, constrained_layout=True
+        )
+        baseline_positions = np.asarray(baseline["output"], dtype=np.float64)
+        baseline_errors = np.asarray(errors_by_mode["gnss_imu"], dtype=np.float64)
+        for mode in direct_modes:
+            positions = np.asarray(results[mode]["output"], dtype=np.float64)
+            errors = np.asarray(errors_by_mode[mode], dtype=np.float64)
+            error_change_mm = 1000.0 * (errors - baseline_errors)
+            state_separation_mm = 1000.0 * np.linalg.norm(
+                positions[:, :2] - baseline_positions[:, :2], axis=1
+            )
+            axes[0].plot(
+                relative_time,
+                np.where(evaluated, error_change_mm, np.nan),
+                color=MODE_COLORS[mode],
+                linewidth=1.2,
+                label=MODE_LABELS.get(mode, mode),
+            )
+            axes[1].plot(
+                relative_time,
+                np.where(evaluated, state_separation_mm, np.nan),
+                color=MODE_COLORS[mode],
+                linewidth=1.2,
+                label=MODE_LABELS.get(mode, mode),
+            )
+        axes[0].axhline(0.0, color="#222222", linewidth=0.9)
+        axes[0].set_ylabel("Error change [mm]\n(negative is better)")
+        axes[0].set_title(
+            f"{dataset_title}\nIncremental effect of each direct map observation"
+        )
+        axes[1].set_ylabel("Horizontal separation\nfrom GNSS/IMU [mm]")
+        axes[1].set_xlabel("Time since start [s]")
+        for axis in axes:
+            axis.grid(True, color="#dddddd", linewidth=0.6)
+            if covered_time.size:
+                axis.set_xlim(float(covered_time[0]), float(covered_time[-1]))
+        axes[0].legend(loc="upper right", frameon=True)
+        figure.savefig(effect_path, dpi=220)
+        plt.close(figure)
+        generated_paths.append(effect_path)
     return tuple(generated_paths)

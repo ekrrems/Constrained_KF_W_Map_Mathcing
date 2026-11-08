@@ -1,9 +1,4 @@
-"""Run one independent MATLAB-data localization experiment.
-
-Select ``MODE`` below and run ``python -m src.map_matlab_main``.  There are no
-command-line arguments. Every process creates a fresh filter, displays the
-trajectory/reference distance live, and saves one final evaluation figure.
-"""
+"""Shared experiment engine for the railway and KITTI comparison runners."""
 
 from __future__ import annotations
 
@@ -20,7 +15,6 @@ from estimation.map_constraint_models import (
     MapHeadingObservation,
 )
 from estimation.gnss_imu_eskf import GnssImuESKF, ProcessNoise
-from estimation.map_reference_evaluation import DistanceStatistics, ReferencePolyline
 from estimation.railway_state import ROT
 from map_matching.algorithms.map_track_matcher import (
     TrackDatabaseMatcher,
@@ -32,8 +26,6 @@ from sensors.map_matlab_data_obtainer import (
     ImuReading,
     MatlabDataObtainer,
 )
-from sensors.map_show_dataset_map import read_reference_nodes
-from visualization.map_result_visualizer import LiveResultVisualizer
 
 
 DATA_FOLDER = Path(
@@ -43,12 +35,6 @@ DATA_FOLDER = Path(
 RECORDING_DATE = "2025_01_30"
 RECORD_SET = 13
 
-# Choose exactly one experiment.
-MODE = "gnss_imu"
-LIVE_VISUALIZATION = True
-LIVE_UPDATE_EVERY_GNSS_EPOCHS = 5
-OUTPUT_DIRECTORY = Path("outputs/map_evaluation")
-REFERENCE_COVERAGE_MAX_DISTANCE_M = 20.0
 VALID_MODES = (
     "gnss_imu",
     "two_step",
@@ -154,7 +140,7 @@ def run_experiment(
     data: MatlabDataObtainer,
     matcher: TrackDatabaseMatcher | None,
     *,
-    mode: str | None = None,
+    mode: str,
     progress_callback: Callable[[int, float, np.ndarray], None] | None = None,
     gnss_dimensions: int = 2,
     use_gnss_velocity: bool = False,
@@ -165,7 +151,7 @@ def run_experiment(
     gnss_lever_arm_b_m: np.ndarray | None = None,
     association_schedule: Sequence[AssociationDecision] | None = None,
 ):
-    selected_mode = MODE if mode is None else mode
+    selected_mode = mode
     if selected_mode not in VALID_MODES:
         raise ValueError(
             f"mode must be one of {VALID_MODES}, got {selected_mode!r}"
@@ -327,7 +313,14 @@ def run_experiment(
                 )
             else:
                 decision = association_schedule[gnss_epoch_index]
-                match = decision.match
+                match = (
+                    None
+                    if decision.match is None
+                    else matcher.reproject_fixed_segment(
+                        decision.match,
+                        eskf.state.position_wb[:2],
+                    )
+                )
             valid = match is not None and not match.ambiguous
             association_valid.append(valid)
             association_ambiguous.append(match is not None and match.ambiguous)
@@ -423,73 +416,3 @@ def run_experiment(
         "gnss_velocity_used": np.asarray(gnss_velocity_used, dtype=bool),
         "gnss_mode": np.asarray(gnss_mode, dtype=int),
     }
-
-
-def main() -> None:
-    data = MatlabDataObtainer(
-        data_folder=DATA_FOLDER,
-        recording_date=RECORDING_DATE,
-        record_set=RECORD_SET,
-        apply_supplied_bias=True,
-        apply_axis_orientation=True,
-    )
-    matcher = TrackDatabaseMatcher(find_unique(DATA_FOLDER, "track.db"))
-    reference_points = np.asarray(
-        read_reference_nodes(find_reference_file(DATA_FOLDER)),
-        dtype=np.float64,
-    )
-    reference = ReferencePolyline(reference_points)
-    visualizer = LiveResultVisualizer(
-        mode=MODE,
-        matcher=matcher,
-        reference=reference,
-        raw_gnss_xy=data.gnss_positions_utm_m[:, :2],
-        update_every_epochs=LIVE_UPDATE_EVERY_GNSS_EPOCHS,
-        live=LIVE_VISUALIZATION,
-    )
-    result = run_experiment(
-        data,
-        matcher,
-        progress_callback=visualizer.update if LIVE_VISUALIZATION else None,
-    )
-    eskf = result["filter"]
-    if not LIVE_VISUALIZATION:
-        visualizer.set_complete_trajectory(result["timestamps"], result["output"])
-    reference_distances = reference.distances(result["output"][:, :2])
-    evaluation_mask = reference.coverage_mask(
-        data.gnss_positions_utm_m[:, :2],
-        maximum_distance_m=REFERENCE_COVERAGE_MAX_DISTANCE_M,
-    )
-    statistics = DistanceStatistics.from_distances(
-        reference_distances[evaluation_mask]
-    )
-    save_path = OUTPUT_DIRECTORY / (
-        f"{RECORDING_DATE}_set_{RECORD_SET:02d}_{MODE}_reference_distance.png"
-    )
-
-    print(f"Mode: {MODE}")
-    print(f"Map segments: {matcher.segment_count}")
-    print("Applied supplied IMU bias:", data.imu_metadata.supplied_bias)
-    print("Applied axis signs:", data.imu_metadata.axis_orientation)
-    print(f"GNSS accepted/rejected: {eskf.gnss_updates_accepted}/{eskf.gnss_updates_rejected}")
-    print("Map updates accepted:", eskf.map_updates_accepted)
-    print("Map updates rejected:", eskf.map_updates_rejected)
-    print(f"Valid map associations: {np.count_nonzero(result['association_valid'])}")
-    print("Final position [m]:", eskf.state.position_wb)
-    print("Final velocity [m/s]:", eskf.state.velocity_wb)
-    print("Residual gyro bias [rad/s]:", eskf.state.gyro_bias)
-    print("Residual accelerometer bias [m/s^2]:", eskf.state.accel_bias)
-    print(
-        "Reference distance [m] "
-        f"mean={statistics.mean_m:.3f}, median={statistics.median_m:.3f}, "
-        f"RMSE={statistics.rmse_m:.3f}, 95%={statistics.percentile_95_m:.3f}, "
-        f"max={statistics.maximum_m:.3f}"
-    )
-    print(f"Reference-distance samples: {len(reference_distances)}")
-    print(f"Saved evaluation figure: {save_path.resolve()}")
-    visualizer.finalize(statistics, save_path)
-    visualizer.show()
-
-
-if __name__ == "__main__":
-    main()

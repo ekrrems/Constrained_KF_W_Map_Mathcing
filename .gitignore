@@ -6,6 +6,7 @@
 outputs
 
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *$py.class
 
@@ -13,3 +14,4 @@ __pycache__/
 outputs/
 cache
 config/
+docs/

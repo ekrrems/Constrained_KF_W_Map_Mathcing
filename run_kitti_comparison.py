@@ -23,13 +23,14 @@ from sensors.kitti_reference import (
     load_kitti_odometry_poses,
     reference_for_selected_frames,
 )
-from src.map_matlab_main import run_experiment
+from src.experiment_engine import run_experiment
 from visualization.experiment_diagnostics import (
     MODE_TITLES,
     plot_dataset_comparison,
     plot_mode_diagnostics,
 )
 from visualization.thesis_story_plots import save_thesis_story_figures
+from visualization.route_quality_report import save_route_quality_report
 
 
 DEFAULT_MODES = (
@@ -122,6 +123,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--show", action=argparse.BooleanOptionalAction, default=True,
+    )
+    parser.add_argument(
+        "--route-window-duration", type=float, default=20.0,
+        help="Duration of every automatic complete-route analysis window [s].",
+    )
+    parser.add_argument(
+        "--route-window-step", type=float, default=5.0,
+        help="Step between automatic complete-route analysis windows [s].",
     )
     return parser
 
@@ -221,7 +230,12 @@ def main() -> None:
 
     probe = KittiRawDataObtainer(
         arguments.source, arguments.date, arguments.drive,
-        imu_source=arguments.imu_source,
+        # This two-frame probe is used only to determine the UTM zone.  The
+        # extract stream can start a fraction of a second after the first sync
+        # frame, so requiring 100 Hz overlap here can reject a drive that has
+        # valid overlap over the actual full experiment.  The full run below
+        # still uses ``arguments.imu_source`` for IMU propagation.
+        imu_source=None,
         start_frame=arguments.start_frame,
         stop_frame=min(effective_stop, arguments.start_frame + 2),
         frame_step=arguments.frame_step,
@@ -316,12 +330,34 @@ def main() -> None:
         results=results, errors_by_mode=errors_by_mode,
         raw_xy=raw_xy, raw_errors_m=raw_errors, reference_xy=reference_xy,
         timestamps=timestamps, gnss_available=available,
+        evaluation_mask=np.ones(len(timestamps), dtype=bool),
         output_directory=arguments.output / "clear_figures",
         dataset_title=(
             f"KITTI urban data — {arguments.date}, drive {int(arguments.drive):04d}"
             + ("" if arguments.reference_kind == "independent"
                else " — non-independent reference proxy")
         ),
+    )
+    route_paths = save_route_quality_report(
+        results=results,
+        errors_by_mode=errors_by_mode,
+        raw_xy=raw_xy,
+        raw_errors_m=raw_errors,
+        reference_at_epochs=reference_xy,
+        reference_geometry=reference_xy,
+        timestamps=timestamps,
+        gnss_available=available,
+        evaluation_mask=np.ones(len(timestamps), dtype=bool),
+        output_directory=arguments.output / "route_quality",
+        dataset_title=(
+            f"KITTI urban data — {arguments.date}, drive {int(arguments.drive):04d}"
+            + ("" if arguments.reference_kind == "independent"
+               else " — non-independent reference proxy")
+        ),
+        state_crs=target_crs,
+        error_metric_label="Horizontal reference error",
+        window_duration_s=arguments.route_window_duration,
+        window_step_s=arguments.route_window_step,
     )
     if arguments.detailed:
         plot_dataset_comparison(
@@ -364,6 +400,7 @@ def main() -> None:
         )
     )
     print(f"  Clear figures: {clear_paths[0].parent.resolve()}")
+    print(f"  Route-wide report: {route_paths[2].parent.resolve()}")
     print(
         "  Interpretation: this is a controlled urban robustness experiment; "
         "KITTI OXTS positions are deliberately withheld according to the stride/outage."
