@@ -51,8 +51,15 @@ class TrackDatabaseMatcher:
         nominal_map_distance_sigma_m: float = 2.0,
         nominal_map_heading_sigma_deg: float = 10.0,
         ambiguity_score_margin: float = 2.0,
+        polyline_lateral_offset_m: float = 0.0,
+        polyline_max_segment_m: float = 10.0,
     ) -> None:
         self.map_path = Path(map_path).expanduser()
+        # Text polylines only: lateral shift (positive = right) and gap length.
+        self.polyline_lateral_offset_m = float(polyline_lateral_offset_m)
+        self.polyline_max_segment_m = float(polyline_max_segment_m)
+        self.reject_free_end_projection = False
+        self.polyline_along_tolerance_m = 1.0
         # Keep the old public attribute for code that may inspect it.
         self.database_path = self.map_path
         self.target_crs = str(target_crs)
@@ -86,9 +93,71 @@ class TrackDatabaseMatcher:
         if suffix in {".db", ".sqlite", ".sqlite3"}:
             self._load_sqlite_segments()
             return
+        if suffix in {".txt", ".csv"}:
+            self._load_polyline_segments()
+            return
         raise ValueError(
-            f"Unsupported map source {self.map_path}; use GeoJSON or SQLite"
+            f"Unsupported map source {self.map_path}; use GeoJSON, SQLite, "
+            "or a projected text polyline"
         )
+
+    @staticmethod
+    def offset_polyline(points: np.ndarray, offset_m: float) -> np.ndarray:
+        """Shift a polyline laterally; positive is right of the stored order."""
+        points = np.asarray(points, dtype=np.float64)
+        if offset_m == 0.0:
+            return points.copy()
+        vectors = np.diff(points, axis=0)
+        tangents = vectors / np.linalg.norm(vectors, axis=1)[:, None]
+        right_normals = np.column_stack((tangents[:, 1], -tangents[:, 0]))
+        vertex_normals = np.empty_like(points)
+        vertex_normals[0] = right_normals[0]
+        vertex_normals[-1] = right_normals[-1]
+        vertex_normals[1:-1] = right_normals[:-1] + right_normals[1:]
+        vertex_normals /= np.linalg.norm(vertex_normals, axis=1)[:, None]
+        return points + float(offset_m) * vertex_normals
+
+    def _load_polyline_segments(self) -> None:
+        """Load a projected text polyline (last two columns: easting, northing)."""
+        import re
+
+        points: list[tuple[float, float]] = []
+        with self.map_path.open("r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                parts = [part for part in re.split(r"[,;\s]+", line.strip()) if part]
+                if len(parts) < 2:
+                    continue
+                try:
+                    values = [float(part) for part in parts]
+                except ValueError:
+                    continue
+                points.append((values[-2], values[-1]))
+        coordinates = np.asarray(points, dtype=np.float64)
+        keep = np.r_[True, np.linalg.norm(np.diff(coordinates, axis=0), axis=1) > 1.0e-6]
+        coordinates = self.offset_polyline(
+            coordinates[keep], self.polyline_lateral_offset_m
+        )
+        self.polyline_points = coordinates
+        self.reject_free_end_projection = True
+        starts: list[np.ndarray] = []
+        ends: list[np.ndarray] = []
+        way_ids: list[int] = []
+        segment_indices: list[int] = []
+        way_id, segment_index = 1, 0
+        self.polyline_gap_count = 0
+        for index in range(len(coordinates) - 1):
+            length = float(np.linalg.norm(coordinates[index + 1] - coordinates[index]))
+            if length > self.polyline_max_segment_m:
+                self.polyline_gap_count += 1
+                way_id += 1
+                segment_index = 0
+                continue
+            starts.append(coordinates[index])
+            ends.append(coordinates[index + 1])
+            way_ids.append(way_id)
+            segment_indices.append(segment_index)
+            segment_index += 1
+        self._set_segments(starts, ends, way_ids, segment_indices)
 
     def _load_sqlite_segments(self) -> None:
         connection = sqlite3.connect(
@@ -196,6 +265,10 @@ class TrackDatabaseMatcher:
         self.segment_tangents = self.segment_vectors / lengths[:, None]
         self.way_ids = np.asarray(way_ids, dtype=np.int64)
         self.segment_indices = np.asarray(segment_indices, dtype=np.int64)
+        next_same_way = np.r_[self.way_ids[1:] == self.way_ids[:-1], False]
+        previous_same_way = np.r_[False, self.way_ids[1:] == self.way_ids[:-1]]
+        self.segment_is_way_start = ~previous_same_way
+        self.segment_is_way_end = ~next_same_way
         self._segment_lookup = {
             (int(way_id), int(segment_index)): array_index
             for array_index, (way_id, segment_index) in enumerate(
@@ -292,6 +365,14 @@ class TrackDatabaseMatcher:
         projections = self.segment_starts + fractions[:, None] * self.segment_vectors
         residuals = position - projections
         distances_squared = np.einsum("ij,ij->i", residuals, residuals)
+        if self.reject_free_end_projection:
+            # Reject positions in digitization gaps (residual not perpendicular).
+            along_residual = np.abs(
+                np.einsum("ij,ij->i", residuals, self.segment_tangents)
+            )
+            free_end = along_residual > self.polyline_along_tolerance_m
+        else:
+            free_end = np.zeros(len(distances_squared), dtype=bool)
 
         raw_headings = np.arctan2(
             self.segment_tangents[:, 1], self.segment_tangents[:, 0]
@@ -318,7 +399,7 @@ class TrackDatabaseMatcher:
         for candidate_index_raw in order:
             candidate_index = int(candidate_index_raw)
             distance = float(np.sqrt(distances_squared[candidate_index]))
-            if distance > self.maximum_distance_m:
+            if distance > self.maximum_distance_m or free_end[candidate_index]:
                 continue
             tangent = self.segment_tangents[candidate_index].copy()
             if reverse_errors[candidate_index] < forward_errors[candidate_index]:

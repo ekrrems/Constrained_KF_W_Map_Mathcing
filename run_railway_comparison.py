@@ -21,6 +21,10 @@ from estimation.map_reference_evaluation import (
     ReferencePolyline,
     block_bootstrap_rmse_interval,
 )
+from estimation.trajectory_metrics import (
+    AngleStatistics, along_cross_errors, gnss_true_path, heading_errors_deg,
+    outage_statistics, outage_windows, reference_tangents, travel_oriented_tangents,
+)
 from map_matching.algorithms.map_track_matcher import TrackDatabaseMatcher
 from sensors.map_matlab_data_obtainer import MatlabDataObtainer
 from sensors.map_show_dataset_map import read_reference_nodes
@@ -85,6 +89,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--modes", nargs="+", choices=DEFAULT_MODES)
+    parser.add_argument(
+        "--map-source", choices=("osm", "orthophoto"), default="osm",
+        help="osm: track.db; orthophoto: Ref_Nodes.txt shifted by --orthophoto-offset.",
+    )
+    parser.add_argument(
+        "--orthophoto-map", type=Path,
+        help="Orthophoto polyline; defaults to Data/Ref_Nodes.txt.",
+    )
+    parser.add_argument(
+        "--orthophoto-offset", type=float, default=0.7175,
+        help="Lateral shift of the orthophoto map [m]; half the standard gauge.",
+    )
+    parser.add_argument(
+        "--orthophoto-max-segment", type=float, default=10.0,
+        help="Longer chords of the orthophoto map are treated as gaps [m].",
+    )
+    parser.add_argument(
+        "--heading-min-speed", type=float, default=2.0,
+        help="Minimum recorded GNSS speed [m/s] for the heading-error metric.",
+    )
     parser.add_argument("--state-crs", default="EPSG:32632")
     parser.add_argument("--map-lateral-std", type=float, default=0.35)
     parser.add_argument("--map-heading-min-std-deg", type=float, default=3.0)
@@ -106,10 +130,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--imu-body-frame",
-        choices=("professor_frd", "raw_flu"),
-        default="professor_frd",
+        choices=("dataset_frd", "raw_flu"),
+        default="dataset_frd",
         help=(
-            "IMU convention. professor_frd applies the supplied AxisOrientation "
+            "IMU convention. dataset_frd applies the supplied AxisOrientation "
             "and initializes a forward-right-down body frame; raw_flu retains "
             "the source signs in a forward-left-up body frame."
         ),
@@ -126,12 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--use-gnss-lever-arm",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help=(
-            "Model the GNSS antenna lever arm inside position and velocity "
-            "updates. Disabled by default because the supplied [0, 0.7, -3] m "
-            "arm is tied to the Ref_Nodes/left-rail evaluation origin, not the "
-            "Intermetric antenna-path reference."
-        ),
+        help="Model the GNSS antenna lever arm (off by default).",
     )
     parser.add_argument(
         "--planar", action="store_true",
@@ -258,7 +277,7 @@ def main() -> None:
         recording_date=arguments.recording_date,
         record_set=arguments.record_set,
         apply_supplied_bias=True,
-        apply_axis_orientation=(arguments.imu_body_frame == "professor_frd"),
+        apply_axis_orientation=(arguments.imu_body_frame == "dataset_frd"),
         horizontal_gnss_std_m=arguments.standalone_std,
         vertical_gnss_std_m=arguments.vertical_gnss_std,
         fixed_rtk_horizontal_std_m=arguments.rtk_fixed_std,
@@ -271,21 +290,36 @@ def main() -> None:
     lever_arm_b_m = np.asarray(arguments.gnss_lever_arm, dtype=np.float64)
     if not arguments.use_gnss_lever_arm:
         lever_arm_b_m = np.zeros(3, dtype=np.float64)
-    elif arguments.imu_body_frame != "professor_frd":
+    elif arguments.imu_body_frame != "dataset_frd":
         raise ValueError(
-            "The default [0, 0.7, -3] m lever arm is defined in the professor "
+            "The default [0, 0.7, -3] m lever arm is defined in the reference "
             "FRD convention. Supply a transformed arm or use "
             "--no-use-gnss-lever-arm with --imu-body-frame raw_flu."
         )
     if arguments.record_set % 2 == 0:
         lever_arm_b_m[1] *= -1.0
-    map_path = find_unique(arguments.data_folder, "track.db")
+    if arguments.map_source == "osm":
+        map_path = find_unique(arguments.data_folder, "track.db")
+        map_offset_m = 0.0
+    else:
+        map_path = (
+            arguments.orthophoto_map.expanduser()
+            if arguments.orthophoto_map is not None
+            else find_unique(arguments.data_folder, "Ref_Nodes.txt")
+        )
+        map_offset_m = arguments.orthophoto_offset
     matcher = TrackDatabaseMatcher(
         map_path,
         target_crs=arguments.state_crs,
         nominal_map_distance_sigma_m=arguments.association_distance_std,
         nominal_map_heading_sigma_deg=arguments.association_heading_std_deg,
         ambiguity_score_margin=arguments.association_ambiguity_margin,
+        polyline_lateral_offset_m=map_offset_m,
+        polyline_max_segment_m=arguments.orthophoto_max_segment,
+    )
+    print(
+        f"Map source: {arguments.map_source} | {map_path} | "
+        f"segments={matcher.segment_count} | lateral offset={map_offset_m:+.2f} m"
     )
     reference_path = (
         arguments.reference.expanduser()
@@ -324,7 +358,7 @@ def main() -> None:
                 arguments.maximum_association_hypotheses
             ),
             imu_body_frame=(
-                "frd" if arguments.imu_body_frame == "professor_frd" else "flu"
+                "frd" if arguments.imu_body_frame == "dataset_frd" else "flu"
             ),
             gnss_lever_arm_b_m=lever_arm_b_m,
         )
@@ -341,7 +375,7 @@ def main() -> None:
                 arguments.maximum_association_hypotheses
             ),
             imu_body_frame=(
-                "frd" if arguments.imu_body_frame == "professor_frd" else "flu"
+                "frd" if arguments.imu_body_frame == "dataset_frd" else "flu"
             ),
             gnss_lever_arm_b_m=lever_arm_b_m,
             association_schedule=(
@@ -483,6 +517,123 @@ def main() -> None:
         window_duration_s=arguments.route_window_duration,
         window_step_s=arguments.route_window_step,
     )
+    # Heading error against the reference tangent.
+    gnss_xy_recorded = data.gnss_positions_utm_m[:, :2]
+    oriented_tangents = travel_oriented_tangents(reference, gnss_xy_recorded)
+    recorded_speed = np.r_[
+        0.0,
+        np.linalg.norm(np.diff(gnss_xy_recorded, axis=0), axis=1)
+        / np.maximum(np.diff(data.gnss_timestamps), 1.0e-9),
+    ]
+    heading_mask = evaluation_mask & (recorded_speed >= arguments.heading_min_speed)
+    heading_errors_by_mode: dict[str, np.ndarray] = {}
+    with (arguments.output / "00_heading_summary.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as stream:
+        writer = csv.writer(stream)
+        writer.writerow([
+            "mode", "count", "mean_abs_deg", "rmse_deg", "percentile_95_abs_deg",
+            "maximum_abs_deg", "signed_mean_deg",
+        ])
+        for mode, result in results.items():
+            errors_deg = heading_errors_deg(result["heading_deg"], oriented_tangents)
+            heading_errors_by_mode[mode] = errors_deg
+            stats = AngleStatistics.from_errors(errors_deg[heading_mask])
+            writer.writerow([
+                mode, stats.count, stats.mean_abs_deg, stats.rmse_deg,
+                stats.percentile_95_deg, stats.maximum_deg, stats.signed_mean_deg,
+            ])
+            print(
+                f"    heading {mode:24s} RMSE={stats.rmse_deg:6.3f} deg "
+                f"p95={stats.percentile_95_deg:6.3f} deg (n={stats.count})"
+            )
+    np.savez(
+        arguments.output / "00_heading_errors.npz",
+        timestamps=data.gnss_timestamps, mask=heading_mask,
+        **heading_errors_by_mode,
+    )
+
+    # Errors during GNSS outages, all against the withheld GNSS.
+    withheld = (data.gnss_mode < 0) & (data.gnss_mode_recorded >= 0)
+    windows = outage_windows(data.gnss_timestamps, withheld)
+    if windows:
+        relative_time = data.gnss_timestamps - data.gnss_timestamps[0]
+        true_path = gnss_true_path(gnss_xy_recorded)
+        path_tangents = reference_tangents(true_path, gnss_xy_recorded)
+        moving = recorded_speed >= arguments.heading_min_speed
+        outage_rows = []
+        outage_series: dict[str, np.ndarray] = {}
+        for mode, result in results.items():
+            estimated = np.asarray(result["output"])[:, :2]
+            horizontal, along, cross = along_cross_errors(
+                true_path, estimated, gnss_xy_recorded, path_tangents
+            )
+            heading_error = heading_errors_deg(result["heading_deg"], path_tangents)
+            outage_series[f"{mode}_horizontal"] = horizontal
+            outage_series[f"{mode}_along"] = along
+            outage_series[f"{mode}_cross"] = cross
+            outage_series[f"{mode}_heading"] = heading_error
+            accepted = np.asarray(result["map_accepted"], dtype=bool)
+            for label, (start, stop) in [("all", (None, None))] + [
+                (f"{relative_time[a]:.0f}-{relative_time[b - 1]:.0f}", (a, b))
+                for a, b in windows
+            ]:
+                if label == "all":
+                    index = np.flatnonzero(withheld)
+                else:
+                    index = np.arange(start, stop)
+                stats = outage_statistics(
+                    horizontal[index], along[index], cross[index]
+                )
+                heading_index = index[moving[index]]
+                heading_rmse = float(np.sqrt(np.mean(heading_error[heading_index] ** 2)))
+                outage_rows.append([
+                    mode, label, stats.count, stats.horizontal_rmse_m,
+                    stats.horizontal_max_m,
+                    stats.horizontal_final_m if label != "all" else "",
+                    stats.along_rmse_m, stats.cross_rmse_m, stats.cross_max_m,
+                    heading_rmse, int(np.count_nonzero(accepted[index])),
+                ])
+        with (arguments.output / "00_outage_summary.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as stream:
+            writer = csv.writer(stream)
+            writer.writerow([
+                "mode", "window_s", "count", "horizontal_rmse_m",
+                "horizontal_max_m", "horizontal_end_of_window_m",
+                "along_rmse_m", "cross_rmse_m", "cross_max_m",
+                "heading_rmse_deg", "map_updates_accepted",
+            ])
+            writer.writerows(outage_rows)
+        np.savez(
+            arguments.output / "00_outage_errors.npz",
+            timestamps=data.gnss_timestamps, withheld=withheld, **outage_series,
+        )
+        print("\nGNSS-outage evaluation against withheld recorded GNSS (all windows)")
+        for row in outage_rows:
+            if row[1] == "all":
+                print(
+                    f"  {row[0]:24s} horizontal RMSE={row[3]:8.3f} m  "
+                    f"along={row[6]:8.3f} m  cross={row[7]:7.3f} m  "
+                    f"heading={row[9]:6.2f} deg"
+                )
+    try:
+        from visualization.extra_thesis_plots import (
+            plot_heading_errors, plot_outage_errors,
+        )
+        plot_heading_errors(
+            data.gnss_timestamps, heading_errors_by_mode, heading_mask,
+            arguments.output / "clear_figures" / "05_heading_error_over_time.png",
+        )
+        if windows:
+            plot_outage_errors(
+                data.gnss_timestamps, outage_series, withheld, list(results),
+                arguments.output / "clear_figures" / "06_outage_error.png",
+                title=f"Error against withheld GNSS during outages ({arguments.map_source} map)",
+            )
+    except Exception as exc:
+        print(f"Warning: extra figures failed: {exc}")
+
     print("\nCommon-reference RMSE")
     print(
         "  Map stochastic model: "
@@ -491,6 +642,7 @@ def main() -> None:
         f"heading reference speed={map_parameters.heading_reference_speed_mps:.2f} m/s"
     )
     print(f"  Association protocol: {arguments.association_protocol}")
+    print(f"  Map source: {arguments.map_source} ({map_path.name}, offset {map_offset_m:+.2f} m)")
     mode_counts = {
         int(value): int(count)
         for value, count in zip(*np.unique(data.gnss_mode_recorded, return_counts=True))

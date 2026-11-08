@@ -8,7 +8,7 @@ to the GNSS timestamp before applying the GNSS measurement update.
 
 The supplied six-value ``sensor.Data.Bias`` vector is interpreted as
 ``[accelerometer xyz, gyroscope xyz]``.  Bias correction is enabled by default.
-The supplied axis signs map the source measurements to the professor code's
+The supplied axis signs map the source measurements to the dataset's
 forward-right-down body convention.  They must only be enabled together with a
 filter initialized in that convention; the alternative raw convention is
 forward-left-up.
@@ -196,9 +196,9 @@ class MatlabDataObtainer:
         self.gnss_velocity_window = int(gnss_velocity_window)
         if self.gnss_velocity_window < 2:
             raise ValueError("gnss_velocity_window must be at least 2")
-        if gnss_velocity_method not in ("none", "professor_difference", "regression"):
+        if gnss_velocity_method not in ("none", "position_difference", "regression"):
             raise ValueError(
-                "gnss_velocity_method must be 'none', 'professor_difference', "
+                "gnss_velocity_method must be 'none', 'position_difference', "
                 "or 'regression'"
             )
         self.gnss_velocity_method = gnss_velocity_method
@@ -385,13 +385,13 @@ class MatlabDataObtainer:
             )
             self.gnss_velocity_valid = np.zeros(count, dtype=bool)
             return
-        if self.gnss_velocity_method == "professor_difference":
-            self._derive_professor_difference_velocity()
+        if self.gnss_velocity_method == "position_difference":
+            self._derive_position_difference_velocity()
             return
         self._derive_causal_regression_velocity()
 
-    def _derive_professor_difference_velocity(self) -> None:
-        """Reproduce the professor code's consecutive-position velocity.
+    def _derive_position_difference_velocity(self) -> None:
+        """Reproduce the dataset's consecutive-position velocity.
 
         The MATLAB implementation uses ``diff(GNSS_XYZ)`` at nominally 1 Hz
         and assigns velocity the same mode-dependent standard deviation as

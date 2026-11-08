@@ -41,7 +41,7 @@ The final user-facing results are:
 - `run.log` and `run_manifest.json` for reproducibility.
 
 The primary Intermetric run explicitly disables the reference-specific
-professor lever arm. The complete lever-arm model remains available in the
+reference lever arm. The complete lever-arm model remains available in the
 comparison engine for a separately labelled reproduction against the matching
 physical reference.
 
@@ -117,3 +117,31 @@ filter. The second performs uncertainty and simulated-outage sensitivity runs.
 The implementation boundaries and paper relationships are documented in
 [`docs/METHOD_PROVENANCE.md`](docs/METHOD_PROVENANCE.md). Dataset/reference
 decisions are in [`docs/DATASET_PROVENANCE.md`](docs/DATASET_PROVENANCE.md).
+
+## Final thesis runs (map sources and GNSS outages)
+
+The map source is selected with `--map-source osm` (OSM ways in `track.db`)
+or `--map-source orthophoto` (true-orthophoto track digitization
+`Data/Ref_Nodes.txt`, shifted half the standard gauge (0.7175 m) from the left
+rail to the antenna path,
+split at gaps longer than 10 m). Each run also writes `00_heading_summary.csv`
+(heading error against the reference tangent) and, when outages are declared,
+`00_outage_summary.csv` (horizontal, along-track and cross-track error against
+the withheld GNSS).
+
+```bash
+# Nominal experiment
+python run_final.py railway --map-source osm        --map-lateral-std 0.35 --association-protocol fixed_baseline
+
+# Outage experiment (five predefined 60 s windows)
+O="--gnss-outage 100:160 --gnss-outage 220:280 --gnss-outage 340:400 --gnss-outage 460:520 --gnss-outage 580:640"
+python run_final.py railway --map-source osm        --map-lateral-std 0.35 --association-protocol end_to_end $O
+python run_final.py railway --map-source orthophoto --map-lateral-std 0.20 --association-protocol end_to_end $O
+```
+
+Runs used in the thesis: `outputs/final_runs/railway/20261108_200504_osm`
+(nominal, OSM), `20261108_211008_osm_outage` and
+`20261108_211109_orthophoto_outage` (outages, evaluated against the withheld
+GNSS). Figures: `python -m visualization.route_error_figure`,
+`python -m visualization.outage_trajectories_figure`.
+Superseded development runs are in `outputs/final_runs/railway/_superseded/`.

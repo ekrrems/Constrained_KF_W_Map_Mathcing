@@ -54,6 +54,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="fixed_baseline",
     )
     railway.add_argument("--map-lateral-std", type=float, default=0.35)
+    railway.add_argument(
+        "--map-source", choices=("osm", "orthophoto"), default="osm",
+        help="OSM track.db or the orthophoto digitization Ref_Nodes.txt.",
+    )
+    railway.add_argument("--orthophoto-offset", type=float, default=0.7175)
+    railway.add_argument(
+        "--data-folder", type=Path,
+        help="EKF_V4_1 data folder; defaults to the path in src/experiment_engine.py.",
+    )
     railway.add_argument("--map-heading-std-deg", type=float, default=3.0)
 
     kitti = subparsers.add_parser(
@@ -93,7 +102,11 @@ def _command(arguments: argparse.Namespace, output: Path) -> list[str]:
             "--route-window-duration", "20",
             "--route-window-step", "5",
             "--output", str(output), "--no-show",
+            "--map-source", arguments.map_source,
+            "--orthophoto-offset", str(arguments.orthophoto_offset),
         ]
+        if arguments.data_folder is not None:
+            command.extend(("--data-folder", str(arguments.data_folder)))
     else:
         command = [
             sys.executable, "-u", "run_kitti_comparison.py",
@@ -118,6 +131,10 @@ def main() -> None:
     arguments = build_parser().parse_args()
     timestamp = datetime.now().astimezone()
     run_id = timestamp.strftime("%Y%m%d_%H%M%S")
+    if arguments.dataset == "railway":
+        run_id += f"_{arguments.map_source}"
+        if arguments.gnss_outage:
+            run_id += "_outage"
     dataset_root = arguments.output_root.expanduser().resolve() / arguments.dataset
     dataset_root.mkdir(parents=True, exist_ok=True)
     output = dataset_root / run_id

@@ -755,7 +755,7 @@ def save_route_quality_report(
         if mode in results and mode in errors_by_mode
     ]
     core_figure, core_axes = plt.subplots(
-        1, len(core_modes), figsize=(15.5, 5.6), squeeze=False,
+        1, len(core_modes), figsize=(12.0, 10.0), squeeze=False,
         constrained_layout=True,
     )
     core_color_artist = None
@@ -776,7 +776,7 @@ def save_route_quality_report(
         axis.set_title(
             f"{MODE_LABELS.get(mode, mode)}\n"
             f"mean {np.mean(values):.3f} m | RMSE {_rmse(values):.3f} m",
-            fontsize=11,
+            fontsize=9,
         )
         axis.set_xlabel("Local easting [m]")
         axis.set_ylabel("Local northing [m]")
