@@ -12,8 +12,6 @@ __pycache__/
 
 
 outputs/
-cache
-docs/
 
 # Recording, maps and references (not distributed with the code)
 data/*

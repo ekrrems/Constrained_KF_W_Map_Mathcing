@@ -42,9 +42,9 @@ the figures and `key_numbers.md` to `outputs/final_runs/railway/thesis_<timestam
 To rebuild only the figures from existing runs:
 
 ```bash
-python reproduce_thesis.py --reuse outputs/final_runs/railway/20261109_060855_osm \
-            outputs/final_runs/railway/20261109_061039_osm_outage \
-            outputs/final_runs/railway/20261109_061210_orthophoto_outage
+python reproduce_thesis.py --reuse outputs/final_runs/railway/20261109_074626_osm \
+            outputs/final_runs/railway/20261109_074735_osm_outage \
+            outputs/final_runs/railway/20261109_074838_orthophoto_outage
 ```
 
 Download the three official DOP20 excerpts at their native 0.20 m ground
@@ -58,8 +58,8 @@ The reproduction command then creates `18_orthophoto_nodes.png` automatically.
 Use `--copy-to-latex /path/to/Latex_thesis/figures/results` to copy every
 generated PNG into the thesis project.
 
-Runs used in the thesis: `20261109_060855_osm`, `20261109_061039_osm_outage`,
-`20261109_061210_orthophoto_outage`.
+Runs used in the thesis: `20261109_074626_osm`, `20261109_074735_osm_outage`,
+`20261109_074838_orthophoto_outage`.
 
 ### Looking at single figures
 
@@ -68,10 +68,10 @@ against track geometry (figure 19):
 
 ```bash
 R=outputs/final_runs/railway
-python -m visualization.outage_geometry_figure $R/20261109_061039_osm_outage \
-    $R/20261109_061210_orthophoto_outage /tmp/19_outage_geometry.png
-python -m visualization.outage_trajectories_figure $R/20261109_061039_osm_outage \
-    $R/20261109_061210_orthophoto_outage data /tmp/01_trajectory.png
+python -m visualization.outage_geometry_figure $R/20261109_074735_osm_outage \
+    $R/20261109_074838_orthophoto_outage /tmp/19_outage_geometry.png
+python -m visualization.outage_trajectories_figure $R/20261109_074735_osm_outage \
+    $R/20261109_074838_orthophoto_outage data /tmp/01_trajectory.png
 ```
 
 Every run folder also contains `clear_figures/` and `route_quality/` with
@@ -140,6 +140,8 @@ Each run folder contains the exact command, Git revision and log, and:
 - `visualization/`: figures (`results_summary_figures.py`, `route_error_figure.py`,
   `outage_trajectories_figure.py`, `constraint_effect_by_geometry.py`,
   `orthophoto_nodes_figure.py` build the thesis figures)
+- `tools/download_dop20_panels.py`: downloads the three DOP20 excerpts of figure 18
+- `docs/THESIS_CODE_MAP.md`: every thesis equation and the code that implements it
 - `tests/`: unit tests (Jacobians by finite differences, constraints, metrics)
 
 ## Tests
