@@ -1,0 +1,55 @@
+{
+  "product": "ATKIS Digital Orthophoto DOP20 RGB",
+  "provider": "Landesamt fuer Geoinformation und Landentwicklung Baden-Wuerttemberg (LGL)",
+  "service": "https://owsproxy.lgl-bw.de/owsproxy/ows/WMS_LGL-BW_ATKIS_DOP_20_C",
+  "layer": "IMAGES_DOP_20_RGB",
+  "crs": "EPSG:25832",
+  "license": "Datenlizenz Deutschland - Namensnennung - Version 2.0",
+  "panels": [
+    {
+      "label": "Northern curve",
+      "image": "dop20_northern_curve.png",
+      "world_file": "dop20_northern_curve.pgw",
+      "bbox_epsg_25832": [
+        524934.0,
+        5385318.0,
+        525074.0,
+        5385458.0
+      ],
+      "width_px": 700,
+      "height_px": 700,
+      "resolution_m_per_pixel": 0.2,
+      "request_url": "https://owsproxy.lgl-bw.de/owsproxy/ows/WMS_LGL-BW_ATKIS_DOP_20_C?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=IMAGES_DOP_20_RGB&STYLES=&SRS=EPSG%3A25832&BBOX=524934.0%2C5385318.0%2C525074.0%2C5385458.0&WIDTH=700&HEIGHT=700&FORMAT=image%2Fpng&TRANSPARENT=FALSE"
+    },
+    {
+      "label": "Forest section",
+      "image": "dop20_forest_section.png",
+      "world_file": "dop20_forest_section.pgw",
+      "bbox_epsg_25832": [
+        525489.0,
+        5382951.0,
+        525709.0,
+        5383171.0
+      ],
+      "width_px": 1100,
+      "height_px": 1100,
+      "resolution_m_per_pixel": 0.2,
+      "request_url": "https://owsproxy.lgl-bw.de/owsproxy/ows/WMS_LGL-BW_ATKIS_DOP_20_C?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=IMAGES_DOP_20_RGB&STYLES=&SRS=EPSG%3A25832&BBOX=525489.0%2C5382951.0%2C525709.0%2C5383171.0&WIDTH=1100&HEIGHT=1100&FORMAT=image%2Fpng&TRANSPARENT=FALSE"
+    },
+    {
+      "label": "Kellerstrasse station",
+      "image": "dop20_kellerstrasse_station.png",
+      "world_file": "dop20_kellerstrasse_station.pgw",
+      "bbox_epsg_25832": [
+        526807.0,
+        5382097.0,
+        526947.0,
+        5382237.0
+      ],
+      "width_px": 700,
+      "height_px": 700,
+      "resolution_m_per_pixel": 0.2,
+      "request_url": "https://owsproxy.lgl-bw.de/owsproxy/ows/WMS_LGL-BW_ATKIS_DOP_20_C?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=IMAGES_DOP_20_RGB&STYLES=&SRS=EPSG%3A25832&BBOX=526807.0%2C5382097.0%2C526947.0%2C5382237.0&WIDTH=700&HEIGHT=700&FORMAT=image%2Fpng&TRANSPARENT=FALSE"
+    }
+  ]
+}

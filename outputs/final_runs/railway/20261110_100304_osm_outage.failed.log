@@ -1,0 +1,32 @@
+Map source: osm | /Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO/data/track.db | segments=438 | lateral offset=+0.00 m
+Evaluation reference: /Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO/data/Ref_Intermetric_UTM.txt | covered epochs=677/780
+[1/5] Running GNSS/IMU ESKF ...
+    RMSE=23.439 m | map accepted=0 | ambiguous=0
+[2/5] Running Two-step map matching (output correction) ...
+    RMSE=22.289 m | map accepted=715 | ambiguous=3
+[3/5] Running Map-heading observation ...
+    RMSE=25.832 m | map accepted=685 | ambiguous=3
+[4/5] Running Direct line-normal coordinate constraint ...
+    RMSE=0.336 m | map accepted=745 | ambiguous=3
+[5/5] Running Combined lateral-position + heading update ...
+    RMSE=4.865 m | map accepted=748 | ambiguous=4
+Traceback (most recent call last):
+  File "/Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO/run_railway_comparison.py", line 702, in <module>
+    main()
+  File "/Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO/run_railway_comparison.py", line 508, in main
+    clear_paths = save_thesis_story_figures(
+  File "/Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO/visualization/thesis_story_plots.py", line 170, in save_thesis_story_figures
+    figure, axis = plt.subplots(figsize=(8.0, 8.0), constrained_layout=True)
+  File "/Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO/.venv/lib/python3.10/site-packages/matplotlib/pyplot.py", line 1776, in subplots
+  File "/Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO/.venv/lib/python3.10/site-packages/matplotlib/pyplot.py", line 1041, in figure
+  File "/Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO/.venv/lib/python3.10/site-packages/matplotlib/pyplot.py", line 550, in new_figure_manager
+  File "/Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO/.venv/lib/python3.10/site-packages/matplotlib/pyplot.py", line 527, in _warn_if_gui_out_of_main_thread
+  File "/Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO/.venv/lib/python3.10/site-packages/matplotlib/pyplot.py", line 368, in _get_backend_mod
+  File "/Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO/.venv/lib/python3.10/site-packages/matplotlib/pyplot.py", line 424, in switch_backend
+  File "/Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO/.venv/lib/python3.10/site-packages/matplotlib/backends/registry.py", line 317, in load_backend_module
+  File "/opt/homebrew/Cellar/python@3.10/3.10.18/Frameworks/Python.framework/Versions/3.10/lib/python3.10/importlib/__init__.py", line 126, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+  File "<frozen importlib._bootstrap>", line 1050, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1004, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 'matplotlib.backends.backend_agg'

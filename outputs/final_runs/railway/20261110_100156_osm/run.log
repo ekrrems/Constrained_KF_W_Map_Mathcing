@@ -1,0 +1,35 @@
+Map source: osm | /Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO/data/track.db | segments=438 | lateral offset=+0.00 m
+Evaluation reference: /Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO/data/Ref_Intermetric_UTM.txt | covered epochs=677/780
+Building fixed association schedule from GNSS/IMU baseline ...
+[1/5] Running GNSS/IMU ESKF ...
+    RMSE=0.082 m | map accepted=0 | ambiguous=0
+[2/5] Running Two-step map matching (output correction) ...
+    RMSE=0.469 m | map accepted=777 | ambiguous=3
+[3/5] Running Map-heading observation ...
+    RMSE=0.082 m | map accepted=773 | ambiguous=3
+[4/5] Running Direct line-normal coordinate constraint ...
+    RMSE=0.073 m | map accepted=720 | ambiguous=3
+[5/5] Running Combined lateral-position + heading update ...
+    RMSE=0.071 m | map accepted=760 | ambiguous=3
+    heading gnss_imu                 RMSE= 1.886 deg p95= 3.619 deg (n=554)
+    heading two_step                 RMSE= 1.886 deg p95= 3.619 deg (n=554)
+    heading one_step_map_heading     RMSE= 0.486 deg p95= 1.024 deg (n=554)
+    heading one_step_cross_track     RMSE= 1.922 deg p95= 3.728 deg (n=554)
+    heading one_step_combined        RMSE= 0.504 deg p95= 0.997 deg (n=554)
+
+Common-reference RMSE
+  Map stochastic model: lateral=0.35 m, heading=1.00 deg
+  Association protocol: fixed_baseline
+  Map source: osm (track.db, offset +0.00 m)
+  GNSS observation model: 3-D; velocity=none; recorded mode counts={4: 779, 5: 1}
+  IMU/antenna model: frame=forward-left-up; lever arm=[0.0, 0.0, 0.0] m
+  Adaptive position sigma: mode 4=0.10 m, mode 5=0.50 m, fallback=5.00 m
+  raw_gnss                           0.118 m
+  gnss_imu                           0.082 m
+  two_step                           0.469 m
+  one_step_map_heading               0.082 m
+  one_step_cross_track               0.073 m
+  one_step_combined                  0.071 m
+All diagnostics:   /Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO/outputs/final_runs/railway/20261110_100156_osm
+Clear figures:     /Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO/outputs/final_runs/railway/20261110_100156_osm/clear_figures
+Route-wide report: /Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO/outputs/final_runs/railway/20261110_100156_osm/route_quality

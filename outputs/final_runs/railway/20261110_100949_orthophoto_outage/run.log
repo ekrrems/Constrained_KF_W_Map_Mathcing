@@ -1,0 +1,41 @@
+Map source: orthophoto | /Users/ekremserdarozturk/Desktop/University_of_Stuttgart/Masters_Thesis/Writing part/Ekrem_Ozturk_Thesis_Code/data/Ref_Nodes.txt | segments=1681 | lateral offset=+0.72 m
+Evaluation reference: /Users/ekremserdarozturk/Desktop/University_of_Stuttgart/Masters_Thesis/Writing part/Ekrem_Ozturk_Thesis_Code/data/Ref_Intermetric_UTM.txt | covered epochs=677/780
+[1/5] Running GNSS/IMU ESKF ...
+    RMSE=23.439 m | map accepted=0 | ambiguous=0
+[2/5] Running Two-step map matching (output correction) ...
+    RMSE=22.441 m | map accepted=635 | ambiguous=0
+[3/5] Running Map-heading observation ...
+    RMSE=27.102 m | map accepted=619 | ambiguous=0
+[4/5] Running Direct line-normal coordinate constraint ...
+    RMSE=0.357 m | map accepted=694 | ambiguous=0
+[5/5] Running Combined lateral-position + heading update ...
+    RMSE=6.881 m | map accepted=614 | ambiguous=0
+    heading gnss_imu                 RMSE= 2.616 deg p95= 5.214 deg (n=554)
+    heading two_step                 RMSE= 2.616 deg p95= 5.214 deg (n=554)
+    heading one_step_map_heading     RMSE= 1.262 deg p95= 2.834 deg (n=554)
+    heading one_step_cross_track     RMSE= 4.704 deg p95=10.126 deg (n=554)
+    heading one_step_combined        RMSE= 4.555 deg p95=16.440 deg (n=554)
+
+GNSS-outage evaluation against withheld recorded GNSS (all windows)
+  gnss_imu                 horizontal RMSE=  76.954 m  along=  70.643 m  cross= 35.303 m  heading=  2.37 deg
+  two_step                 horizontal RMSE=  76.350 m  along=  70.627 m  cross= 33.799 m  heading=  2.37 deg
+  one_step_map_heading     horizontal RMSE=  74.387 m  along=  65.515 m  cross= 40.800 m  heading=  1.79 deg
+  one_step_cross_track     horizontal RMSE=  81.497 m  along=  82.526 m  cross=  0.568 m  heading=  4.41 deg
+  one_step_combined        horizontal RMSE=  65.799 m  along=  67.749 m  cross= 10.358 m  heading=  2.14 deg
+
+Common-reference RMSE
+  Map stochastic model: lateral=0.20 m, heading=1.00 deg
+  Association protocol: end_to_end
+  Map source: orthophoto (Ref_Nodes.txt, offset +0.72 m)
+  GNSS observation model: 3-D; velocity=none; recorded mode counts={4: 779, 5: 1}
+  IMU/antenna model: frame=forward-left-up; lever arm=[0.0, 0.0, 0.0] m
+  Adaptive position sigma: mode 4=0.10 m, mode 5=0.50 m, fallback=5.00 m
+  raw_gnss                           0.118 m
+  gnss_imu                          23.439 m
+  two_step                          22.441 m
+  one_step_map_heading              27.102 m
+  one_step_cross_track               0.357 m
+  one_step_combined                  6.881 m
+All diagnostics:   /Users/ekremserdarozturk/Desktop/University_of_Stuttgart/Masters_Thesis/Writing part/Ekrem_Ozturk_Thesis_Code/outputs/final_runs/railway/20261110_100949_orthophoto_outage
+Clear figures:     /Users/ekremserdarozturk/Desktop/University_of_Stuttgart/Masters_Thesis/Writing part/Ekrem_Ozturk_Thesis_Code/outputs/final_runs/railway/20261110_100949_orthophoto_outage/clear_figures
+Route-wide report: /Users/ekremserdarozturk/Desktop/University_of_Stuttgart/Masters_Thesis/Writing part/Ekrem_Ozturk_Thesis_Code/outputs/final_runs/railway/20261110_100949_orthophoto_outage/route_quality
