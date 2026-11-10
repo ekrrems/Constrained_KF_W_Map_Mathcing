@@ -1,147 +1,149 @@
-# Thesis map-constraint implementation
+# Map data as an additional sensor in a GNSS/IMU ESKF
 
-This repository compares map information inside one common GNSS/IMU
-error-state extended Kalman filter. The primary experiment uses the railway
-dataset and the Intermetric reference. KITTI is a secondary urban stress test,
-not independent thesis validation.
+Implementation for the master's thesis *Integration of Map Data into a
+Constrained Kalman Filter as an Additional Sensor* (University of Stuttgart,
+Institute of Engineering Geodesy).
 
-## Run the final railway comparison
+A GNSS/IMU error-state Kalman filter is extended with map observations derived
+from OpenStreetMap and from an orthophoto track digitization:
+
+| Mode | Map information | Filter update |
+|---|---|---|
+| `gnss_imu` | none | GNSS position only |
+| `two_step` | closest map point | output only (conventional map matching) |
+| `one_step_map_heading` | track direction | yaw |
+| `one_step_cross_track` | track line | lateral position |
+| `one_step_combined` | track line and direction | lateral position and yaw |
+
+## Setup
 
 ```bash
-cd "/Users/ekremserdarozturk/Desktop/Projects/Python/Map_Matching_VIO"
+python -m venv .venv
 source .venv/bin/activate
-python -u run_final.py railway
+pip install -r requirements.txt
 ```
 
-The terminal displays all five stages while they run:
+All inputs are read from `data/` in the repository (see `data/README.md`): the
+IMU and GNSS `.mat` files of the recording, `track.db` (OSM), `Ref_Nodes.txt`
+(orthophoto track digitization) and `Ref_Intermetric_UTM.txt` (evaluation
+reference). `--data-folder` points to another folder if needed.
 
-1. GNSS/IMU ESKF;
-2. two-step output projection;
-3. map-heading observation;
-4. direct line-normal coordinate constraint;
-5. combined lateral-position and heading update.
+## Reproduce the thesis
 
-Every run receives its own directory under
-`outputs/final_runs/railway/YYYYMMDD_HHMMSS`. The exact command, Git revision,
-worktree state and terminal log are stored with the results. The path of the
-newest successful run is written to `outputs/final_runs/railway/LATEST.txt`.
-
-The final user-facing results are:
-
-- `00_rmse_summary.csv` for the numerical comparison;
-- `clear_figures/` for compact thesis figures;
-- `route_quality/02_route_quality_overview.png` for the complete-route report;
-- `route_quality/03_notable_interval_details.png` for automatically detected
-  good, bad and high-error intervals;
-- `route_quality/04_route_quality_satellite_map.html` for spatial inspection;
-- `route_quality/05_method_error_maps.png` for one spatial error map per method
-  on a common colour scale;
-- `route_quality/06_method_error_over_time.png` for one time-series panel per
-  method on common axes;
-- `run.log` and `run_manifest.json` for reproducibility.
-
-The primary Intermetric run explicitly disables the reference-specific
-reference lever arm. The complete lever-arm model remains available in the
-comparison engine for a separately labelled reproduction against the matching
-physical reference.
-
-The primary constraint-comparison protocol is `fixed_baseline`: every method
-replays the same discrete map associations, while its continuous closest point
-and residual are recomputed from that method's state. This isolates the
-measurement formulation from association feedback. To test the complete
-closed-loop systems instead, run:
+One command runs the three experiments, builds every thesis figure under its
+thesis file name, and writes the numbers of the result tables:
 
 ```bash
-python -u run_final.py railway --association-protocol end_to_end
+python reproduce_thesis.py
 ```
 
-The primary lateral map standard deviation is 0.35 m, giving a scalar
-line-normal observation variance of 0.1225 m². This value is the robust scale
-(`1.4826 × MAD`) of the measured OSM-to-Intermetric lateral disagreement over
-the covered route, computed before comparing filter modes. It is a
-dataset-specific stochastic model, not a universal OSM accuracy claim. The
-separate sensitivity study reports how the conclusions change for weaker and
-stronger map weighting.
-
-The two-step baseline is intentionally a hard output projection: it replaces
-the reported horizontal position with the closest point on the selected OSM
-segment, without updating the filter state or covariance. Consequently, its
-error against the Intermetric antenna-path reference also measures the local
-OSM-to-reference disagreement. It must not be interpreted as a softly weighted
-map measurement or tuned to reproduce the Intermetric line.
-
-An optional controlled outage must always be described as simulated:
+It takes about 5 to 10 minutes. The runs go to `outputs/final_runs/railway/<timestamp>_<map>[_outage]/`,
+the figures and `key_numbers.md` to `outputs/final_runs/railway/thesis_<timestamp>/`.
+To rebuild only the figures from existing runs:
 
 ```bash
-python -u run_final.py railway --gnss-outage 292:322
+python reproduce_thesis.py --reuse outputs/final_runs/railway/20261109_060855_osm \
+            outputs/final_runs/railway/20261109_061039_osm_outage \
+            outputs/final_runs/railway/20261109_061210_orthophoto_outage
 ```
 
-## Run KITTI
-
-After granting the terminal application permission to read the Desktop dataset:
+Download the three official DOP20 excerpts at their native 0.20 m ground
+sampling distance once:
 
 ```bash
-python -u run_final.py kitti
+python tools/download_dop20_panels.py
 ```
 
-The default uses the synchronized drive for GNSS/reference epochs, the extract
-drive for 100 Hz IMU propagation, every tenth synchronized GNSS epoch, and the
-KITTI odometry poses as a **non-independent proxy**. These results must not be
-presented as independent accuracy validation. Custom paths can be supplied with
-`--sync`, `--imu-source`, and `--reference-poses`.
+The reproduction command then creates `18_orthophoto_nodes.png` automatically.
+Use `--copy-to-latex /path/to/Latex_thesis/figures/results` to copy every
+generated PNG into the thesis project.
 
-## Supporting final studies
+Runs used in the thesis: `20261109_060855_osm`, `20261109_061039_osm_outage`,
+`20261109_061210_orthophoto_outage`.
 
-These are deliberately separate from the main comparison:
+### Looking at single figures
+
+Each figure script can also be run on its own, for example the outage windows
+against track geometry (figure 19):
 
 ```bash
-python estimate_osm_uncertainty.py
-python run_map_sensitivity.py --association-protocol fixed_baseline
+R=outputs/final_runs/railway
+python -m visualization.outage_geometry_figure $R/20261109_061039_osm_outage \
+    $R/20261109_061210_orthophoto_outage /tmp/19_outage_geometry.png
+python -m visualization.outage_trajectories_figure $R/20261109_061039_osm_outage \
+    $R/20261109_061210_orthophoto_outage data /tmp/01_trajectory.png
 ```
 
-The first estimates local OSM/reference disagreement without changing the
-filter. The second performs uncertainty and simulated-outage sensitivity runs.
+Every run folder also contains `clear_figures/` and `route_quality/` with
+diagnostic plots, the per-epoch CSV files and `00_outage_summary.csv`.
+In the outage figures the filter without map is labelled *IMU only (GNSS
+withheld)*, because it receives no GNSS inside the windows.
 
-## Repository guide
-
-- `run_final.py`: final, traceable user entry point;
-- `run_railway_comparison.py`: railway comparison engine;
-- `run_kitti_comparison.py`: KITTI comparison engine;
-- `estimation/`: ESKF and measurement models;
-- `map_matching/`: map association;
-- `visualization/route_quality_report.py`: complete-route report;
-- `tests/test_map_constraints.py`: propagation, Jacobian, gating and regression
-  checks;
-- `docs/`: dataset, implementation and literature provenance.
-
-The implementation boundaries and paper relationships are documented in
-[`docs/METHOD_PROVENANCE.md`](docs/METHOD_PROVENANCE.md). Dataset/reference
-decisions are in [`docs/DATASET_PROVENANCE.md`](docs/DATASET_PROVENANCE.md).
-
-## Final thesis runs (map sources and GNSS outages)
-
-The map source is selected with `--map-source osm` (OSM ways in `track.db`)
-or `--map-source orthophoto` (true-orthophoto track digitization
-`Data/Ref_Nodes.txt`, shifted half the standard gauge (0.7175 m) from the left
-rail to the antenna path,
-split at gaps longer than 10 m). Each run also writes `00_heading_summary.csv`
-(heading error against the reference tangent) and, when outages are declared,
-`00_outage_summary.csv` (horizontal, along-track and cross-track error against
-the withheld GNSS).
+## Single experiments
 
 ```bash
-# Nominal experiment
-python run_final.py railway --map-source osm        --map-lateral-std 0.35 --association-protocol fixed_baseline
+# Nominal: all GNSS, OSM constraints, evaluated against the digitized evaluation reference
+python run_final.py --map-source osm --map-lateral-std 0.35 \
+    --association-protocol fixed_baseline
 
-# Outage experiment (five predefined 60 s windows)
+# Outages: GNSS withheld in five 60 s windows, evaluated against the withheld GNSS
 O="--gnss-outage 100:160 --gnss-outage 220:280 --gnss-outage 340:400 --gnss-outage 460:520 --gnss-outage 580:640"
-python run_final.py railway --map-source osm        --map-lateral-std 0.35 --association-protocol end_to_end $O
-python run_final.py railway --map-source orthophoto --map-lateral-std 0.20 --association-protocol end_to_end $O
+python run_final.py --map-source osm --map-lateral-std 0.35 --association-protocol end_to_end $O
+python run_final.py --map-source orthophoto --map-lateral-std 0.20 --association-protocol end_to_end $O
 ```
 
-Runs used in the thesis: `outputs/final_runs/railway/20261108_200504_osm`
-(nominal, OSM), `20261108_211008_osm_outage` and
-`20261108_211109_orthophoto_outage` (outages, evaluated against the withheld
-GNSS). Figures: `python -m visualization.route_error_figure`,
-`python -m visualization.outage_trajectories_figure`.
-Superseded development runs are in `outputs/final_runs/railway/_superseded/`.
+Each run folder contains the exact command, Git revision and log, and:
+
+- `00_rmse_summary.csv`: distance to the evaluation reference per mode
+- `00_heading_summary.csv`: heading error against the reference direction
+- `00_outage_summary.csv`: horizontal, along-track, cross-track and heading
+  error against the withheld GNSS, per window and in total (outage runs only)
+- `0X_<mode>_epochs.csv`: per-epoch positions and filter diagnostics
+- `clear_figures/`, `route_quality/`: overview figures
+
+## Frames and observation noise
+
+- World frame: east-north-up, realized by UTM zone 32N coordinates (GNSS
+  latitude/longitude converted in `sensors/railway_dataset.py`; maps in the
+  same grid). Gravity is `[0, 0, -9.81]`.
+- Body frame: forward-left-up. The reader applies the recording's
+  AxisOrientation signs (which give forward-right-down) and then rotates by
+  180 degrees about the forward axis, so both frames have z up.
+- Antenna and track: the filter position is the roof GNSS antenna. The map
+  observations, the reported position and the nominal evaluation use the track
+  point 3 m below it (`--track-offset 0 0 -3`, body frame), applied with the
+  current attitude; the map update treats the attitude as known. Outage errors
+  compare the antenna with the withheld GNSS.
+- GNSS reacquisition: on the first GNSS epoch after an outage the position and
+  velocity covariance is reset to the size of the innovation and decorrelated
+  from the other states (`--reset-after-outage`, on by default).
+- Map heading standard deviation: 1 degree for both maps, at every speed.
+
+## Map sources
+
+- **OSM**: ordered nodes and ways from `track.db`, lateral standard deviation
+  0.35 m (median distance of the recorded RTK GNSS to the OSM ways).
+- **Orthophoto**: `Ref_Nodes.txt`, shifted laterally by half the standard
+  gauge (0.7175 m) to the antenna path and split at chords longer than 10 m;
+  lateral standard deviation 0.20 m (one orthophoto pixel). Used in the outage
+  experiment only, so it is never evaluated against the orthophoto reference.
+
+## Repository layout
+
+- `run_final.py`: entry point with run bookkeeping
+- `run_railway_comparison.py`: railway experiment
+- `estimation/`: ESKF, map constraint models, evaluation metrics
+- `map_matching/algorithms/map_track_matcher.py`: map loading and association
+- `sensors/railway_dataset.py`: reader for the railway recording (.mat files)
+- `sensors/reference_reader.py`: reader for projected reference polylines
+- `reproduce_thesis.py`: all experiments, thesis figures and key numbers
+- `visualization/`: figures (`results_summary_figures.py`, `route_error_figure.py`,
+  `outage_trajectories_figure.py`, `constraint_effect_by_geometry.py`,
+  `orthophoto_nodes_figure.py` build the thesis figures)
+- `tests/`: unit tests (Jacobians by finite differences, constraints, metrics)
+
+## Tests
+
+```bash
+python -m pytest -q
+```

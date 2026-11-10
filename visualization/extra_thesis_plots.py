@@ -27,6 +27,14 @@ def plot_heading_errors(timestamps, errors_by_mode, mask, save_path: Path,
     save_path.parent.mkdir(parents=True, exist_ok=True)
     time = np.asarray(timestamps) - timestamps[0]
     figure, axis = plt.subplots(figsize=(11, 4.2))
+    mask = np.asarray(mask, dtype=bool)
+    edges = np.flatnonzero(np.diff(np.r_[0, (~mask).astype(int), 0]))
+    step = float(np.median(np.diff(time)))
+    for number, (start, stop) in enumerate(zip(edges[::2], edges[1::2])):
+        axis.axvspan(time[start] - 0.5 * step, time[stop - 1] + 0.5 * step, color="#d9d9d9",
+                     alpha=0.6, linewidth=0,
+                     label="Not evaluated (slower than 2 m/s or outside the reference)"
+                     if number == 0 else None)
     for mode in PLOT_ORDER:
         if mode not in errors_by_mode:
             continue
@@ -50,7 +58,9 @@ def plot_heading_errors(timestamps, errors_by_mode, mask, save_path: Path,
 
 
 def plot_outage_errors(timestamps, series, withheld, modes, save_path: Path,
-                       title: str | None = "Error against withheld GNSS during outages") -> Path:
+                       title: str | None = "Error against withheld GNSS during outages",
+                       labels: dict[str, str] | None = None) -> Path:
+    labels = {**MODE_LABELS, **(labels or {})}
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     time = np.asarray(timestamps) - timestamps[0]
@@ -64,8 +74,9 @@ def plot_outage_errors(timestamps, series, withheld, modes, save_path: Path,
         horizontal = np.where(withheld, series[f"{mode}_horizontal"], np.nan)
         cross = np.where(withheld, np.abs(series[f"{mode}_cross"]), np.nan)
         rmse = np.sqrt(np.nanmean(horizontal**2))
+        cross_rmse = np.sqrt(np.nanmean(cross**2))
         axes[0].plot(time, horizontal, color=MODE_COLORS[mode], linewidth=1.4,
-                     label=f"{MODE_LABELS[mode]} (RMSE {rmse:.2f} m)")
+                     label=f"{labels[mode]}: RMSE horizontal {rmse:.2f} m, cross-track {cross_rmse:.2f} m")
         axes[1].plot(time, cross, color=MODE_COLORS[mode], linewidth=1.4)
     axes[0].set_ylabel("Horizontal error [m]")
     axes[1].set_ylabel("|Cross-track error| [m]")

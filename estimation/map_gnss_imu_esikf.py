@@ -1,8 +1,6 @@
-"""Error-state extended Kalman filter for the railway IMU/GNSS recordings.
+"""Error-state Kalman filter for the railway IMU/GNSS recording.
 
-This class intentionally contains no KITTI, camera, or LiDAR dependencies. It
-uses the existing project's state and quaternion conventions while accepting
-``ImuReading`` and ``GnssReading`` from ``matlab_data_obtainer``.
+Consumes ``ImuReading`` and ``GnssReading`` from ``sensors.railway_dataset``.
 """
 
 from __future__ import annotations
@@ -29,10 +27,10 @@ from geometry.quaternion import (
     quaternion_to_rotation_matrix,
     rotation_vector_to_quaternion,
 )
-from sensors.map_matlab_data_obtainer import (
+from sensors.railway_dataset import (
     GnssReading,
     ImuReading,
-    MatlabDataObtainer,
+    RailwayDataset,
 )
 
 if TYPE_CHECKING:
@@ -41,7 +39,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class ProcessNoise:
-    """Continuous-time IMU noise densities.
+    """Continuous-time IMU noise densities (thesis Eq. 5.13, used in Q_c, Eq. 4.16).
 
     The defaults are explicit engineering starting values, not a calibration.
     Thesis runs should record the chosen values and replace them with sensor
@@ -82,7 +80,7 @@ class GnssImuESKF:
 
     def __init__(
         self,
-        data: MatlabDataObtainer,
+        data: RailwayDataset,
         *,
         process_noise: ProcessNoise | None = None,
         gnss_dimensions: int = 2,
@@ -90,8 +88,8 @@ class GnssImuESKF:
         gnss_nis_threshold: float | None = None,
         reject_gnss_outliers: bool = False,
         maximum_imu_interval_s: float = 0.25,
-        imu_body_frame: str | None = None,
         gnss_lever_arm_b_m: np.ndarray | None = None,
+        initial_accel_bias_std_mps2: float = 0.5,
     ) -> None:
         self.state = RailwayESKFState()
         self.previous_imu: ImuReading | None = None
@@ -115,26 +113,15 @@ class GnssImuESKF:
         self.maximum_imu_interval_s = float(maximum_imu_interval_s)
         if self.maximum_imu_interval_s <= 0.0:
             raise ValueError("maximum_imu_interval_s must be positive")
-        axis_orientation_applied = bool(
-            getattr(data, "apply_axis_orientation", False)
-        )
-        inferred_frame = "frd" if axis_orientation_applied else "flu"
-        self.imu_body_frame = inferred_frame if imu_body_frame is None else imu_body_frame
-        if self.imu_body_frame not in ("flu", "frd"):
-            raise ValueError("imu_body_frame must be 'flu' or 'frd'")
-        if self.imu_body_frame == "frd" and not axis_orientation_applied:
-            raise ValueError(
-                "The FRD filter convention requires the supplied IMU axis orientation"
-            )
-        if self.imu_body_frame == "flu" and axis_orientation_applied:
-            raise ValueError(
-                "The supplied IMU axis orientation targets FRD, not the FLU convention"
-            )
         self.gnss_lever_arm_b_m = np.asarray(
             np.zeros(3) if gnss_lever_arm_b_m is None else gnss_lever_arm_b_m,
             dtype=np.float64,
         ).reshape(3)
+        self.initial_accel_bias_std_mps2 = float(initial_accel_bias_std_mps2)
         self.gnss_updates_accepted = 0
+        # Error-state indices that map updates may not change (see
+        # freeze_tilt_in_map_updates).
+        self.map_frozen_states: np.ndarray | None = None
         self.gnss_updates_rejected = 0
         self.map_updates_accepted: dict[str, int] = {}
         self.map_updates_rejected: dict[str, int] = {}
@@ -175,6 +162,9 @@ class GnssImuESKF:
         corrected_angular_velocity_b: np.ndarray | None = None,
     ) -> np.ndarray:
         """Return the antenna position/velocity observation matrix.
+
+        Thesis Eq. (4.22): H_g = [0 I 0 0 0 0] (the lever arm is zero in the
+        thesis runs, so the attitude columns below are zero).
 
         The attitude error is right-multiplicative.  A zero lever arm reduces
         this matrix to direct position and velocity observations.
@@ -222,9 +212,11 @@ class GnssImuESKF:
         if STATE_DIM != 18:
             raise ValueError(f"This implementation expects STATE_DIM=18, got {STATE_DIM}")
 
-    def _initialize_from_data(self, data: MatlabDataObtainer) -> None:
+    def _initialize_from_data(self, data: RailwayDataset) -> None:
         first = data.gnss_reading(0)
 
+        # Thesis Eq. (5.10)-(5.11): constant-velocity line fit through up to 12
+        # GNSS fixes gives the initial velocity and yaw; p_0 = first GNSS fix.
         # A short least-squares fit is considerably less sensitive to 1 Hz GNSS
         # jitter than a velocity made from only the first two observations.
         fit_count = min(12, len(data.gnss_timestamps))
@@ -241,21 +233,13 @@ class GnssImuESKF:
         )
         velocity_w = slope if horizontal_speed >= 0.2 else np.zeros(3)
 
+        # Body frame forward-left-up, world frame east-north-up: the initial
+        # attitude is a pure yaw rotation about the common z axis.
         half_yaw = 0.5 * heading_rad
-        yaw_quaternion = np.array(
+        self.state.quaternion_wb = np.array(
             [np.cos(half_yaw), 0.0, 0.0, np.sin(half_yaw)],
             dtype=np.float64,
         )
-        if self.imu_body_frame == "frd":
-            # FRD differs from FLU by a 180-degree rotation about body x.
-            self.state.quaternion_wb = normalize_quaternion(
-                quaternion_multiply(
-                    yaw_quaternion,
-                    np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64),
-                )
-            )
-        else:
-            self.state.quaternion_wb = yaw_quaternion
         initial_rotation = quaternion_to_rotation_matrix(self.state.quaternion_wb)
         self.state.position_wb = (
             first.position_utm_m - initial_rotation @ self.gnss_lever_arm_b_m
@@ -268,12 +252,13 @@ class GnssImuESKF:
         # Preserve the state's default gravity vector. The supplied accelerometer
         # has approximately +9.81 m/s² on body z while stationary, matching the
         # propagation convention R_wb @ specific_force + gravity_w.
+        # Thesis Eq. (5.12): initial error covariance P_0.
         covariance = np.asarray(self.state.covariance, dtype=np.float64).copy()
         covariance[ROT, ROT] = np.eye(3) * np.deg2rad(10.0) ** 2
         covariance[POS, POS] = first.covariance_m2
         covariance[VEL, VEL] = np.eye(3) * 5.0**2
         covariance[GYRO_BIAS, GYRO_BIAS] = np.eye(3) * np.deg2rad(2.0) ** 2
-        covariance[ACCEL_BIAS, ACCEL_BIAS] = np.eye(3) * 0.5**2
+        covariance[ACCEL_BIAS, ACCEL_BIAS] = np.eye(3) * self.initial_accel_bias_std_mps2**2
         covariance[GRAVITY, GRAVITY] = np.eye(3) * 0.1**2
         self.state.covariance = 0.5 * (covariance + covariance.T)
 
@@ -294,6 +279,7 @@ class GnssImuESKF:
         if dt > self.maximum_imu_interval_s:
             raise ValueError(f"Unexpectedly large IMU interval: {dt} s")
 
+        # Thesis Eq. (4.5)-(4.6): midpoint IMU sample minus bias estimate.
         acceleration_mid = 0.5 * (
             self.previous_imu.acceleration_mps2 + measurement.acceleration_mps2
         )
@@ -303,6 +289,7 @@ class GnssImuESKF:
         corrected_angular_velocity = angular_velocity_mid - self.state.gyro_bias
         corrected_specific_force = acceleration_mid - self.state.accel_bias
 
+        # Thesis Eq. (4.7)-(4.10): nominal propagation (a_w, p, v, q).
         rotation_wb = quaternion_to_rotation_matrix(self.state.quaternion_wb)
         acceleration_world = (
             rotation_wb @ corrected_specific_force + self.state.gravity_w
@@ -342,12 +329,14 @@ class GnssImuESKF:
             rotation_wb,
         )
 
+        # Thesis Eq. (4.11)-(4.15): noise mapping G (noise terms of Eq. 4.11-4.14).
         noise_mapping = np.zeros((STATE_DIM, NOISE_DIM), dtype=np.float64)
         noise_mapping[ROT, 0:3] = -np.eye(3)
         noise_mapping[VEL, 3:6] = -rotation_wb
         noise_mapping[GYRO_BIAS, 6:9] = np.eye(3)
         noise_mapping[ACCEL_BIAS, 9:12] = np.eye(3)
         noise = self.process_noise
+        # Thesis Eq. (4.16): Q_c.
         continuous_noise_covariance = np.diag(
             [noise.gyro_noise_sigma**2] * 3
             + [noise.accel_noise_sigma**2] * 3
@@ -355,6 +344,8 @@ class GnssImuESKF:
             + [noise.accel_bias_random_walk_sigma**2] * 3
         )
 
+        # Thesis Eq. (4.17)-(4.19): Phi = I + F dt, Q_d = G Q_c G^T dt,
+        # P^- = Phi P Phi^T + Q_d.
         transition = np.eye(STATE_DIM, dtype=np.float64) + transition_rate * dt
         with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
             discrete_process_noise = (
@@ -373,7 +364,7 @@ class GnssImuESKF:
             )
         if not np.all(np.isfinite(covariance)):
             raise FloatingPointError("Non-finite covariance after IMU propagation")
-        self.state.covariance = 0.5 * (covariance + covariance.T)
+        self.state.covariance = 0.5 * (covariance + covariance.T)  # Eq. (5.14)
 
     def continuous_error_transition_matrix(
         self,
@@ -382,6 +373,9 @@ class GnssImuESKF:
         rotation_wb: np.ndarray,
     ) -> np.ndarray:
         """Construct the continuous-time error-state Jacobian ``F``.
+
+        Thesis Eq. (4.11)-(4.15): the rows below are the error dynamics of
+        attitude, position and velocity; the bias and gravity rows are zero.
 
         Keeping this construction separate makes the propagation model
         directly finite-difference testable and avoids duplicating equations
@@ -397,6 +391,32 @@ class GnssImuESKF:
         transition_rate[VEL, ACCEL_BIAS] = -rotation_wb
         transition_rate[VEL, GRAVITY] = np.eye(3)
         return transition_rate
+
+    def reset_after_gnss_outage(self, measurement: GnssReading, outage_s: float) -> None:
+        """Prepare the first GNSS update after an outage (thesis Eq. 4.24).
+
+        After an outage the position can be wrong by tens of metres.  Without
+        a reset, that correction is spread through the cross-covariances into
+        attitude and biases.  The position and velocity variances are raised
+        to the size of the GNSS innovation and decorrelated from all other
+        states, so the first fix corrects position and velocity only.
+        """
+        rotation = quaternion_to_rotation_matrix(self.state.quaternion_wb)
+        innovation = (
+            np.asarray(measurement.position_utm_m, dtype=np.float64)
+            - (self.state.position_wb + rotation @ self.gnss_lever_arm_b_m)
+        )
+        covariance = self.state.covariance.copy()
+        position_variance = np.maximum(np.diag(covariance[POS, POS]), innovation**2)
+        velocity_variance = np.maximum(
+            np.diag(covariance[VEL, VEL]), (innovation / max(outage_s, 1.0)) ** 2
+        )
+        navigation = np.r_[np.arange(POS.start, POS.stop), np.arange(VEL.start, VEL.stop)]
+        covariance[navigation, :] = 0.0
+        covariance[:, navigation] = 0.0
+        covariance[POS, POS] = np.diag(position_variance)
+        covariance[VEL, VEL] = np.diag(velocity_variance)
+        self.state.covariance = covariance
 
     def gnss_measurement_update(
         self,
@@ -418,6 +438,7 @@ class GnssImuESKF:
         predicted_antenna_position = (
             predicted_position + rotation_wb @ lever_arm
         )
+        # Thesis Eq. (4.20)-(4.21): GNSS observes the antenna position.
         position_innovation = (
             measurement.position_utm_m[:dimension]
             - predicted_antenna_position[:dimension]
@@ -495,11 +516,14 @@ class GnssImuESKF:
         return float(np.arctan2(np.sin(angle_rad), np.cos(angle_rad)))
 
     def quaternion_to_yaw_rad(self) -> float:
+        # Thesis Eq. (4.43): psi_hat = atan2(R21, R11).
         rotation = quaternion_to_rotation_matrix(self.state.quaternion_wb)
         return float(np.arctan2(rotation[1, 0], rotation[0, 0]))
 
     def yaw_error_jacobian(self, epsilon_rad: float = 1.0e-7) -> np.ndarray:
         """Differentiate world yaw w.r.t. the filter's local attitude error.
+
+        Thesis Eq. (4.45): central difference with epsilon = 1e-7 rad.
 
         The error-state injection is right-multiplicative, ``q <- q * dq``.
         Consequently, a map-yaw observation does not generally have the fixed
@@ -537,6 +561,20 @@ class GnssImuESKF:
             )
         return derivative
 
+    def freeze_tilt_in_map_updates(self) -> None:
+        """Map updates may not change roll, pitch, their gyroscope biases,
+        the accelerometer bias or gravity.
+
+        With a GNSS lever arm, a lateral map residual on the ground point can
+        otherwise be explained by tilting the vehicle (the roof antenna stays
+        on the GNSS position), with the accelerometer bias absorbing the
+        resulting gravity component.
+        """
+        self.map_frozen_states = np.r_[ROT.start, ROT.start + 1,
+                                       GYRO_BIAS.start, GYRO_BIAS.start + 1,
+                                       np.arange(ACCEL_BIAS.start, ACCEL_BIAS.stop),
+                                       np.arange(GRAVITY.start, GRAVITY.stop)]
+
     def apply_map_constraint(
         self,
         constraint: "LinearizedMapConstraint",
@@ -546,6 +584,7 @@ class GnssImuESKF:
             constraint.jacobian,
             constraint.covariance,
             constraint.nis_threshold,
+            frozen_states=getattr(self, "map_frozen_states", None),
         )
         counter = self.map_updates_accepted if accepted else self.map_updates_rejected
         counter[constraint.name] = counter.get(constraint.name, 0) + 1
@@ -563,11 +602,15 @@ class GnssImuESKF:
         measurement_jacobian: np.ndarray,
         measurement_covariance: np.ndarray,
         nis_threshold: float,
+        frozen_states: np.ndarray | None = None,
     ) -> tuple[bool, float]:
+        """Kalman update; ``frozen_states`` lists error-state indices whose gain
+        rows are set to zero (the Joseph form stays valid for this gain)."""
         innovation = np.asarray(innovation, dtype=np.float64).reshape(-1)
         jacobian = np.asarray(measurement_jacobian, dtype=np.float64)
         covariance_r = np.asarray(measurement_covariance, dtype=np.float64)
         covariance_prior = self.state.covariance.copy()
+        # Thesis Eq. (4.47)-(4.48): S = H P H^T + R, NIS = r^T S^-1 r.
         with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
             innovation_covariance = (
                 jacobian @ covariance_prior @ jacobian.T + covariance_r
@@ -576,21 +619,26 @@ class GnssImuESKF:
         nis = float(innovation @ solved_innovation)
         if not np.isfinite(nis):
             raise FloatingPointError("Measurement NIS is not finite")
-        if nis > float(nis_threshold):
+        if nis > float(nis_threshold):  # innovation gate (Sec. 4.7)
             return False, nis
 
+        # Thesis Eq. (4.49)-(4.50): K = P H^T S^-1, delta_x = K r.
         with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
             kalman_gain = np.linalg.solve(
                 innovation_covariance, jacobian @ covariance_prior
             ).T
+            if frozen_states is not None and len(frozen_states):
+                kalman_gain[frozen_states, :] = 0.0
             delta_state = kalman_gain @ innovation
             identity = np.eye(STATE_DIM, dtype=np.float64)
             correction = identity - kalman_gain @ jacobian
         with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            # Thesis Eq. (4.52): Joseph form.
             covariance_posterior = (
                 correction @ covariance_prior @ correction.T
                 + kalman_gain @ covariance_r @ kalman_gain.T
             )
+        # Thesis Eq. (4.51) injection and Eq. (4.53) P+ = J_r P' J_r^T.
         reset_jacobian = self._inject_error_state(delta_state)
         with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
             covariance_posterior = (
@@ -598,10 +646,11 @@ class GnssImuESKF:
             )
         if not np.all(np.isfinite(covariance_posterior)):
             raise FloatingPointError("Non-finite covariance after measurement update")
-        self.state.covariance = 0.5 * (covariance_posterior + covariance_posterior.T)
+        self.state.covariance = 0.5 * (covariance_posterior + covariance_posterior.T)  # Eq. (5.14)
         return True, nis
 
     def _inject_error_state(self, delta_state: np.ndarray) -> np.ndarray:
+        """Thesis Eq. (4.51): x+ = x- [+] delta_x; returns J_r of Eq. (4.53)."""
         delta = np.asarray(delta_state, dtype=np.float64).reshape(STATE_DIM)
         delta_rotation = delta[ROT].copy()
         self.state.quaternion_wb = normalize_quaternion(

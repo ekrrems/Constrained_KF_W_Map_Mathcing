@@ -26,8 +26,8 @@ from estimation.trajectory_metrics import (
     outage_statistics, outage_windows, reference_tangents, travel_oriented_tangents,
 )
 from map_matching.algorithms.map_track_matcher import TrackDatabaseMatcher
-from sensors.map_matlab_data_obtainer import MatlabDataObtainer
-from sensors.map_show_dataset_map import read_reference_nodes
+from sensors.railway_dataset import RailwayDataset
+from sensors.reference_reader import read_reference_nodes
 from src.experiment_engine import (
     DATA_FOLDER, RECORDING_DATE, RECORD_SET, find_reference_file, find_unique,
     run_experiment,
@@ -88,6 +88,37 @@ def build_parser() -> argparse.ArgumentParser:
             "is always excluded."
         ),
     )
+    parser.add_argument(
+        "--reference-max-segment", type=float, default=None,
+        help="Treat longer chords of the evaluation polyline as gaps [m] "
+             "(needed when Ref_Nodes.txt is the reference).",
+    )
+    parser.add_argument(
+        "--map-travel-offset", type=float, default=0.0,
+        help="Move the map line to the left (+) of the direction of travel [m], "
+             "e.g. 0.7 to put the OSM centre line on the left rail.",
+    )
+    parser.add_argument(
+        "--track-offset", nargs=3, type=float, default=(0.0, 0.0, -3.0),
+        metavar=("X", "Y", "Z"),
+        help="Offset from the GNSS antenna to the track point described by the map "
+             "and the reference, forward-left-up body frame [m]. Default: the roof "
+             "antenna is 3 m above the track.",
+    )
+    parser.add_argument(
+        "--reset-after-outage", action=argparse.BooleanOptionalAction, default=True,
+        help="Reset and decorrelate position/velocity covariance on the first GNSS "
+             "epoch after an outage.",
+    )
+    parser.add_argument(
+        "--initial-accel-bias-std", type=float, default=0.5,
+        help="Initial standard deviation of the residual accelerometer bias [m/s^2].",
+    )
+    parser.add_argument(
+        "--map-freeze-tilt", action="store_true",
+        help="Map updates do not change roll, pitch, accelerometer bias or gravity "
+             "(recommended with a GNSS lever arm).",
+    )
     parser.add_argument("--modes", nargs="+", choices=DEFAULT_MODES)
     parser.add_argument(
         "--map-source", choices=("osm", "orthophoto"), default="osm",
@@ -111,9 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--state-crs", default="EPSG:32632")
     parser.add_argument("--map-lateral-std", type=float, default=0.35)
-    parser.add_argument("--map-heading-min-std-deg", type=float, default=3.0)
-    parser.add_argument("--map-heading-reference-speed", type=float, default=20.0)
-    parser.add_argument("--map-heading-min-speed", type=float, default=1.0)
+    parser.add_argument("--map-heading-std-deg", type=float, default=1.0)
     parser.add_argument("--association-distance-std", type=float, default=2.0)
     parser.add_argument("--association-heading-std-deg", type=float, default=10.0)
     parser.add_argument("--association-ambiguity-margin", type=float, default=2.0)
@@ -129,22 +158,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--imu-body-frame",
-        choices=("dataset_frd", "raw_flu"),
-        default="dataset_frd",
-        help=(
-            "IMU convention. dataset_frd applies the supplied AxisOrientation "
-            "and initializes a forward-right-down body frame; raw_flu retains "
-            "the source signs in a forward-left-up body frame."
-        ),
-    )
-    parser.add_argument(
         "--gnss-lever-arm",
         nargs=3,
         type=float,
         metavar=("X", "Y", "Z"),
-        default=(0.0, 0.7, -3.0),
-        help="Body-frame state-origin-to-GNSS-antenna lever arm in metres.",
+        default=(0.0, -0.7, 3.0),
+        help="State-origin-to-antenna lever arm in the forward-left-up body frame [m].",
     )
     parser.add_argument(
         "--use-gnss-lever-arm",
@@ -262,9 +281,7 @@ def main() -> None:
     modes = list(DEFAULT_MODES if arguments.modes is None else arguments.modes)
     map_parameters = MapConstraintParameters(
         lateral_std_m=arguments.map_lateral_std,
-        minimum_heading_std_deg=arguments.map_heading_min_std_deg,
-        heading_reference_speed_mps=arguments.map_heading_reference_speed,
-        minimum_heading_speed_mps=arguments.map_heading_min_speed,
+        heading_std_deg=arguments.map_heading_std_deg,
     )
     process_noise = ProcessNoise(
         gyro_noise_sigma=arguments.gyro_noise_sigma,
@@ -272,12 +289,12 @@ def main() -> None:
         gyro_bias_random_walk_sigma=arguments.gyro_bias_rw_sigma,
         accel_bias_random_walk_sigma=arguments.accel_bias_rw_sigma,
     )
-    data = MatlabDataObtainer(
+    data = RailwayDataset(
         data_folder=arguments.data_folder,
         recording_date=arguments.recording_date,
         record_set=arguments.record_set,
         apply_supplied_bias=True,
-        apply_axis_orientation=(arguments.imu_body_frame == "dataset_frd"),
+        apply_axis_orientation=True,
         horizontal_gnss_std_m=arguments.standalone_std,
         vertical_gnss_std_m=arguments.vertical_gnss_std,
         fixed_rtk_horizontal_std_m=arguments.rtk_fixed_std,
@@ -290,12 +307,6 @@ def main() -> None:
     lever_arm_b_m = np.asarray(arguments.gnss_lever_arm, dtype=np.float64)
     if not arguments.use_gnss_lever_arm:
         lever_arm_b_m = np.zeros(3, dtype=np.float64)
-    elif arguments.imu_body_frame != "dataset_frd":
-        raise ValueError(
-            "The default [0, 0.7, -3] m lever arm is defined in the reference "
-            "FRD convention. Supply a transformed arm or use "
-            "--no-use-gnss-lever-arm with --imu-body-frame raw_flu."
-        )
     if arguments.record_set % 2 == 0:
         lever_arm_b_m[1] *= -1.0
     if arguments.map_source == "osm":
@@ -316,6 +327,7 @@ def main() -> None:
         ambiguity_score_margin=arguments.association_ambiguity_margin,
         polyline_lateral_offset_m=map_offset_m,
         polyline_max_segment_m=arguments.orthophoto_max_segment,
+        travel_lateral_offset_m=arguments.map_travel_offset,
     )
     print(
         f"Map source: {arguments.map_source} | {map_path} | "
@@ -329,7 +341,14 @@ def main() -> None:
     if not reference_path.is_file():
         raise FileNotFoundError(f"Evaluation reference not found: {reference_path}")
     reference_points = np.asarray(read_reference_nodes(reference_path), dtype=np.float64)
-    reference = ReferencePolyline(reference_points)
+    reference = ReferencePolyline(
+        reference_points, max_segment_m=arguments.reference_max_segment
+    )
+    # Heading is always evaluated against the direction of the continuous
+    # centre-line reference; its long, dense polyline gives a smooth tangent.
+    heading_reference = ReferencePolyline(
+        np.asarray(read_reference_nodes(find_reference_file(arguments.data_folder)), dtype=np.float64)
+    )
     raw_xy = data.gnss_positions_utm_m[:, :2]
     raw_errors = reference.distances(raw_xy)
     evaluation_mask = reference.coverage_mask(
@@ -357,10 +376,11 @@ def main() -> None:
             maximum_association_hypotheses=(
                 arguments.maximum_association_hypotheses
             ),
-            imu_body_frame=(
-                "frd" if arguments.imu_body_frame == "dataset_frd" else "flu"
-            ),
             gnss_lever_arm_b_m=lever_arm_b_m,
+            freeze_tilt_in_map_updates=arguments.map_freeze_tilt,
+            initial_accel_bias_std_mps2=arguments.initial_accel_bias_std,
+            track_offset_b_m=np.asarray(arguments.track_offset, dtype=np.float64),
+            reset_after_outage=arguments.reset_after_outage,
         )
         fixed_association_schedule = association_source["association_schedule"]
     for index, mode in enumerate(modes, start=1):
@@ -374,10 +394,11 @@ def main() -> None:
             maximum_association_hypotheses=(
                 arguments.maximum_association_hypotheses
             ),
-            imu_body_frame=(
-                "frd" if arguments.imu_body_frame == "dataset_frd" else "flu"
-            ),
             gnss_lever_arm_b_m=lever_arm_b_m,
+            freeze_tilt_in_map_updates=arguments.map_freeze_tilt,
+            initial_accel_bias_std_mps2=arguments.initial_accel_bias_std,
+            track_offset_b_m=np.asarray(arguments.track_offset, dtype=np.float64),
+            reset_after_outage=arguments.reset_after_outage,
             association_schedule=(
                 fixed_association_schedule if mode in DEFAULT_MODES[1:] else None
             ),
@@ -392,7 +413,7 @@ def main() -> None:
                 result=result, reference_xy=reference_points, raw_xy=raw_xy,
                 reference_errors_m=errors, raw_errors_m=raw_errors,
                 save_path=figure_path,
-                dataset_label=(f"Intermetric MATLAB data — {arguments.recording_date}, "
+                dataset_label=(f"Railway dataset — {arguments.recording_date}, "
                                f"set {arguments.record_set}"),
                 reference_description=(
                     f"Nearest distance to {reference_path.name} (evaluation only)"
@@ -414,7 +435,7 @@ def main() -> None:
             results=results, reference_xy=reference_points, raw_xy=raw_xy,
             errors_by_mode=errors_by_mode, raw_errors_m=raw_errors,
             timestamps=data.gnss_timestamps, save_path=comparison_path,
-            dataset_label=(f"Intermetric MATLAB data — {arguments.recording_date}, "
+            dataset_label=(f"Railway dataset — {arguments.recording_date}, "
                            f"set {arguments.record_set}"),
             matcher=matcher, evaluation_mask=evaluation_mask,
             gnss_available=gnss_available, show=arguments.show,
@@ -519,13 +540,17 @@ def main() -> None:
     )
     # Heading error against the reference tangent.
     gnss_xy_recorded = data.gnss_positions_utm_m[:, :2]
-    oriented_tangents = travel_oriented_tangents(reference, gnss_xy_recorded)
+    oriented_tangents = travel_oriented_tangents(heading_reference, gnss_xy_recorded)
     recorded_speed = np.r_[
         0.0,
         np.linalg.norm(np.diff(gnss_xy_recorded, axis=0), axis=1)
         / np.maximum(np.diff(data.gnss_timestamps), 1.0e-9),
     ]
-    heading_mask = evaluation_mask & (recorded_speed >= arguments.heading_min_speed)
+    heading_mask = (
+        evaluation_mask
+        & heading_reference.coverage_mask(raw_xy, maximum_distance_m=arguments.reference_max_distance)
+        & (recorded_speed >= arguments.heading_min_speed)
+    )
     heading_errors_by_mode: dict[str, np.ndarray] = {}
     with (arguments.output / "00_heading_summary.csv").open(
         "w", newline="", encoding="utf-8"
@@ -564,7 +589,8 @@ def main() -> None:
         outage_rows = []
         outage_series: dict[str, np.ndarray] = {}
         for mode, result in results.items():
-            estimated = np.asarray(result["output"])[:, :2]
+            # The withheld GNSS is the antenna: compare the predicted antenna.
+            estimated = np.asarray(result["antenna_output"])[:, :2]
             horizontal, along, cross = along_cross_errors(
                 true_path, estimated, gnss_xy_recorded, path_tangents
             )
@@ -638,8 +664,7 @@ def main() -> None:
     print(
         "  Map stochastic model: "
         f"lateral={map_parameters.lateral_std_m:.2f} m, "
-        f"minimum heading={map_parameters.minimum_heading_std_deg:.2f} deg, "
-        f"heading reference speed={map_parameters.heading_reference_speed_mps:.2f} m/s"
+        f"heading={map_parameters.heading_std_deg:.2f} deg"
     )
     print(f"  Association protocol: {arguments.association_protocol}")
     print(f"  Map source: {arguments.map_source} ({map_path.name}, offset {map_offset_m:+.2f} m)")
@@ -655,7 +680,7 @@ def main() -> None:
     )
     print(
         "  IMU/antenna model: "
-        f"frame={arguments.imu_body_frame}; "
+        "frame=forward-left-up; "
         f"lever arm={lever_arm_b_m.tolist()} m"
     )
     print(

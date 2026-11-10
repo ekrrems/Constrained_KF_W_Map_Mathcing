@@ -16,7 +16,7 @@ from visualization.map_result_visualizer import MODE_COLORS, map_segments_near_t
 MODE_TITLES = {
     "gnss_imu": "GNSS/IMU ESKF",
     "two_step": "Two-step map matching (output correction)",
-    "one_step_map_heading": "Fouque-style map-heading observation",
+    "one_step_map_heading": "Map-heading observation",
     "one_step_cross_track": "Direct line-normal coordinate constraint",
     "one_step_combined": "Combined lateral-position + heading update",
 }
@@ -26,7 +26,7 @@ COMPARISON_LABELS = {
     "raw_gnss": "Recorded GNSS positions (unfiltered)",
     "gnss_imu": "IMU + GNSS",
     "two_step": "Two-step map matching",
-    "one_step_map_heading": "Fouque-style heading",
+    "one_step_map_heading": "Map heading",
     "one_step_cross_track": "Line-normal coordinate",
     "one_step_combined": "Combined: lateral + heading",
 }

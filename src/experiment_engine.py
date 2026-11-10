@@ -1,4 +1,4 @@
-"""Shared experiment engine for the railway and KITTI comparison runners."""
+"""Experiment engine: runs one estimation mode over the railway recording."""
 
 from __future__ import annotations
 
@@ -16,24 +16,20 @@ from estimation.map_constraint_models import (
 )
 from estimation.gnss_imu_eskf import GnssImuESKF, ProcessNoise
 from estimation.railway_state import ROT
+from geometry.quaternion import quaternion_to_rotation_matrix
 from map_matching.algorithms.map_track_matcher import (
     TrackDatabaseMatcher,
     TrackHypothesisManager,
     TrackMatch,
 )
-from sensors.map_matlab_data_obtainer import (
+from sensors.railway_dataset import (
+    DATA_FOLDER,
+    RECORD_SET,
+    RECORDING_DATE,
     GnssReading,
     ImuReading,
-    MatlabDataObtainer,
+    RailwayDataset,
 )
-
-
-DATA_FOLDER = Path(
-    "/Users/ekremserdarozturk/Desktop/University_of_Stuttgart/"
-    "Masters_Thesis/Data/EKF_V4_1"
-)
-RECORDING_DATE = "2025_01_30"
-RECORD_SET = 13
 
 VALID_MODES = (
     "gnss_imu",
@@ -96,11 +92,7 @@ def make_constraint(
 ):
     parameters = parameters or MapConstraintParameters()
     if mode == "one_step_map_heading":
-        return MapHeadingObservation(
-            minimum_std_deg=parameters.minimum_heading_std_deg,
-            reference_speed_mps=parameters.heading_reference_speed_mps,
-            minimum_speed_mps=parameters.minimum_heading_speed_mps,
-        )
+        return MapHeadingObservation(heading_std_deg=parameters.heading_std_deg)
     if mode == "one_step_cross_track":
         return CrossTrackPositionConstraint(
             lateral_std_m=parameters.lateral_std_m
@@ -108,9 +100,7 @@ def make_constraint(
     if mode == "one_step_combined":
         return CombinedCrossTrackHeadingConstraint(
             lateral_std_m=parameters.lateral_std_m,
-            minimum_heading_std_deg=parameters.minimum_heading_std_deg,
-            reference_speed_mps=parameters.heading_reference_speed_mps,
-            minimum_speed_mps=parameters.minimum_heading_speed_mps,
+            heading_std_deg=parameters.heading_std_deg,
         )
     return None
 
@@ -121,7 +111,6 @@ def linearize_constraint(model, match: TrackMatch, eskf: GnssImuESKF):
         return model.linearize(
             match,
             predicted_heading_rad=eskf.quaternion_to_yaw_rad(),
-            speed_mps=float(np.linalg.norm(eskf.state.velocity_wb[:2])),
             heading_error_jacobian=yaw_jacobian,
         )
     if isinstance(model, CrossTrackPositionConstraint):
@@ -130,14 +119,13 @@ def linearize_constraint(model, match: TrackMatch, eskf: GnssImuESKF):
         return model.linearize(
             match,
             predicted_heading_rad=eskf.quaternion_to_yaw_rad(),
-            speed_mps=float(np.linalg.norm(eskf.state.velocity_wb[:2])),
             heading_error_jacobian=yaw_jacobian,
         )
     return None
 
 
 def run_experiment(
-    data: MatlabDataObtainer,
+    data: RailwayDataset,
     matcher: TrackDatabaseMatcher | None,
     *,
     mode: str,
@@ -147,8 +135,11 @@ def run_experiment(
     process_noise: ProcessNoise | None = None,
     map_parameters: MapConstraintParameters | None = None,
     maximum_association_hypotheses: int = 5,
-    imu_body_frame: str | None = None,
     gnss_lever_arm_b_m: np.ndarray | None = None,
+    freeze_tilt_in_map_updates: bool = False,
+    initial_accel_bias_std_mps2: float = 0.5,
+    track_offset_b_m: np.ndarray | None = None,
+    reset_after_outage: bool = False,
     association_schedule: Sequence[AssociationDecision] | None = None,
 ):
     selected_mode = mode
@@ -171,9 +162,25 @@ def run_experiment(
         process_noise=process_noise,
         gnss_dimensions=gnss_dimensions,
         use_gnss_velocity=use_gnss_velocity,
-        imu_body_frame=imu_body_frame,
         gnss_lever_arm_b_m=gnss_lever_arm_b_m,
+        initial_accel_bias_std_mps2=initial_accel_bias_std_mps2,
     )
+    if freeze_tilt_in_map_updates:
+        eskf.freeze_tilt_in_map_updates()
+    # Offset from the GNSS antenna (the filter position) to the point on the
+    # track that the map and the evaluation reference describe, in the body
+    # frame, e.g. [0, 0, -3] for a roof antenna 3 m above the track.  It is
+    # applied with the current attitude; the map update itself corrects only
+    # the position (the attitude is treated as known there).
+    track_offset = np.zeros(3) if track_offset_b_m is None else np.asarray(
+        track_offset_b_m, dtype=np.float64).reshape(3)
+
+    withheld_since: float | None = None
+
+    def track_point() -> np.ndarray:
+        # Thesis Eq. (4.23): p_t = p_wb + R_wb t_b.
+        rotation = quaternion_to_rotation_matrix(eskf.state.quaternion_wb)
+        return eskf.state.position_wb + rotation @ track_offset
     hypothesis_manager = (
         TrackHypothesisManager(
             matcher,
@@ -185,6 +192,7 @@ def run_experiment(
     constraint_model = make_constraint(selected_mode, map_parameters)
     output_timestamps: list[float] = []
     output_positions: list[np.ndarray] = []
+    antenna_positions: list[np.ndarray] = []
     predicted_positions: list[np.ndarray] = []
     gnss_nis: list[float] = []
     gnss_dof: list[int] = []
@@ -217,6 +225,11 @@ def run_experiment(
         position = np.asarray(position_w, dtype=np.float64).reshape(3).copy()
         output_timestamps.append(float(timestamp))
         output_positions.append(position)
+        antenna_positions.append(
+            position
+            + quaternion_to_rotation_matrix(eskf.state.quaternion_wb)
+            @ (eskf.gnss_lever_arm_b_m - track_offset)
+        )
         state_positions.append(eskf.state.position_wb.copy())
         covariance_diagonal = np.maximum(
             np.diag(eskf.state.covariance), 0.0
@@ -258,7 +271,15 @@ def run_experiment(
         )
         gnss_mode.append(int(measurement.mode))
 
+        # Thesis Eq. (4.54): GNSS update first (with the reset of Eq. 4.24
+        # after an outage), then the map update below.
         gnss_available = measurement.mode >= 0
+        if gnss_available and reset_after_outage and withheld_since is not None:
+            eskf.reset_after_gnss_outage(measurement, measurement.timestamp - withheld_since)
+        if gnss_available:
+            withheld_since = None
+        elif withheld_since is None:
+            withheld_since = measurement.timestamp
         if gnss_available:
             gnss_result = eskf.gnss_measurement_update(measurement)
             gnss_nis.append(gnss_result.nis)
@@ -271,7 +292,7 @@ def run_experiment(
             gnss_accepted.append(False)
 
         if selected_mode == "gnss_imu":
-            record_output(measurement.timestamp, eskf.state.position_wb)
+            record_output(measurement.timestamp, track_point())
             map_nis.append(np.nan)
             map_update_accepted.append(False)
             association_valid.append(False)
@@ -296,8 +317,10 @@ def run_experiment(
                     @ eskf.state.covariance[ROT, ROT]
                     @ yaw_jacobian
                 )
+                # Thesis Eq. (4.34)-(4.38): association at the track point with
+                # sigma inflated by P_xy and P_psipsi.
                 match = hypothesis_manager.update(
-                    eskf.state.position_wb[:2],
+                    track_point()[:2],
                     eskf.quaternion_to_yaw_rad(),
                     position_covariance_xy=eskf.state.covariance[3:5, 3:5],
                     heading_variance_rad2=max(0.0, yaw_variance),
@@ -318,7 +341,7 @@ def run_experiment(
                     if decision.match is None
                     else matcher.reproject_fixed_segment(
                         decision.match,
-                        eskf.state.position_wb[:2],
+                        track_point()[:2],
                     )
                 )
             valid = match is not None and not match.ambiguous
@@ -333,15 +356,16 @@ def run_experiment(
             selected_way_id.append(-1 if match is None else match.way_id)
             association_decisions.append(decision)
             if selected_mode == "two_step":
+                # Thesis Eq. (4.55): two-step baseline.
                 if valid:
                     # External output correction only: the ESKF state is
                     # deliberately unchanged.
-                    corrected_output = eskf.state.position_wb.copy()
+                    corrected_output = track_point()
                     corrected_output[:2] = match.closest_point_xy
                     map_nis.append(np.nan)
                     map_update_accepted.append(True)
                 else:
-                    corrected_output = eskf.state.position_wb
+                    corrected_output = track_point()
                     map_nis.append(np.nan)
                     map_update_accepted.append(False)
                 record_output(measurement.timestamp, corrected_output)
@@ -373,7 +397,7 @@ def run_experiment(
                 AssociationDecision(None, 0, np.nan, 0.0, 0.0)
             )
 
-        record_output(measurement.timestamp, eskf.state.position_wb)
+        record_output(measurement.timestamp, track_point())
         gnss_epoch_index += 1
 
     return {
@@ -381,15 +405,14 @@ def run_experiment(
         "filter": eskf,
         "timestamps": np.asarray(output_timestamps),
         "output": np.asarray(output_positions),
+        # Predicted antenna position (output + R_wb @ lever arm); equals the
+        # output when no lever arm is modelled.
+        "antenna_output": np.asarray(antenna_positions),
         "prediction": np.asarray(predicted_positions),
         "state_output": np.asarray(state_positions),
         "position_std_xy_m": np.asarray(position_std_xy_m),
         "yaw_std_deg": np.asarray(yaw_std_deg),
         "heading_deg": np.asarray(heading_deg),
-        # ``speed_mps`` remains as a compatibility alias, but now means the
-        # physically interpretable horizontal speed rather than a 3-D norm
-        # that could hide vertical-state divergence.
-        "speed_mps": np.asarray(horizontal_speed_mps),
         "horizontal_speed_mps": np.asarray(horizontal_speed_mps),
         "vertical_velocity_mps": np.asarray(vertical_velocity_mps),
         "height_m": np.asarray(height_m),

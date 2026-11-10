@@ -1,5 +1,5 @@
 numpy>=2.0
 scipy>=1.13
 matplotlib>=3.9
-pillow>=10
+pyproj>=3.6
 pytest>=8

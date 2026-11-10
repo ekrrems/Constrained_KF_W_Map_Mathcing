@@ -1,12 +1,12 @@
 """Linearized map observations used in the railway ESKF comparison.
 
-The heading observation follows the map-aided heading concept of Fouque,
-Bonnifait, and Betaille (IEEE/ION PLANS 2008).  The coordinate observation is
-the line-normal limit of the anisotropic map observation described by El
-Najjar and Bonnifait (Autonomous Robots, 2005): uncertainty along the segment
-is left unconstrained while the signed perpendicular distance is observed as
-zero.  The stacked coordinate/heading observation is a thesis experiment and
-is not attributed to either source as a complete published algorithm.
+The heading observation uses the direction of the matched segment as an
+observation of vehicle yaw, as in Fouque, Bonnifait, and Betaille (IEEE/ION
+PLANS 2008).  The coordinate observation is the straight-segment limit of the
+road-aligned map observation of El Najjar and Bonnifait (Autonomous Robots 19,
+2005): the variance along the segment is infinite, so only the signed
+perpendicular distance is observed.  Stacking both into one update is a
+design choice of this work.
 """
 
 from __future__ import annotations
@@ -30,78 +30,44 @@ class LinearizedMapConstraint:
 
 @dataclass(frozen=True)
 class MapConstraintParameters:
-    """Shared, reportable stochastic parameters for the map experiments."""
+    """Standard deviations of the map observations."""
 
-    lateral_std_m: float = 2.0
-    minimum_heading_std_deg: float = 3.0
-    heading_reference_speed_mps: float = 20.0
-    minimum_heading_speed_mps: float = 1.0
+    lateral_std_m: float = 0.35
+    heading_std_deg: float = 1.0
 
     def __post_init__(self) -> None:
         if self.lateral_std_m <= 0.0:
             raise ValueError("lateral_std_m must be positive")
-        if not 0.0 < self.minimum_heading_std_deg <= 90.0:
-            raise ValueError("minimum_heading_std_deg must be in (0, 90]")
-        if self.heading_reference_speed_mps <= 0.0:
-            raise ValueError("heading_reference_speed_mps must be positive")
-        if self.minimum_heading_speed_mps < 0.0:
-            raise ValueError("minimum_heading_speed_mps must be non-negative")
+        if not 0.0 < self.heading_std_deg <= 90.0:
+            raise ValueError("heading_std_deg must be in (0, 90]")
 
 
 def wrap_angle(angle_rad: float) -> float:
     return float(np.arctan2(np.sin(angle_rad), np.cos(angle_rad)))
 
 
-def speed_dependent_heading_std_rad(
-    speed_mps: float,
-    *,
-    minimum_std_rad: float = np.deg2rad(3.0),
-    reference_speed_mps: float = 20.0,
-) -> float:
-    """Fouque et al. map-heading uncertainty decreasing toward ``sigma_0``.
-
-    At standstill the map tangent is not a useful vehicle-heading observation,
-    so its standard deviation approaches pi/2.  It decreases linearly to the
-    segment's minimum map-heading uncertainty at the reference speed and stays
-    there at higher speed.
-    """
-    if reference_speed_mps <= 0.0:
-        raise ValueError("reference_speed_mps must be positive")
-    ratio = float(np.clip(abs(speed_mps) / reference_speed_mps, 0.0, 1.0))
-    return float((1.0 - ratio) * (np.pi / 2.0) + ratio * minimum_std_rad)
-
-
 class MapHeadingObservation:
-    """Directed segment-heading pseudo-measurement after Fouque et al."""
-    def __init__(
-        self,
-        *,
-        minimum_std_deg: float = 3.0,
-        reference_speed_mps: float = 20.0,
-        minimum_speed_mps: float = 1.0,
-    ) -> None:
-        self.minimum_std_rad = float(np.deg2rad(minimum_std_deg))
-        self.reference_speed_mps = float(reference_speed_mps)
-        self.minimum_speed_mps = float(minimum_speed_mps)
+    """Segment direction used as an observation of vehicle yaw.
+
+    Thesis Sec. 4.6: residual Eq. (4.44), Jacobian Eq. (4.45),
+    sigma_psi = 1 deg and gate 6.6349 (Eq. 5.8).
+    """
+
+    def __init__(self, *, heading_std_deg: float = 1.0) -> None:
+        self.heading_std_rad = float(np.deg2rad(heading_std_deg))
 
     def linearize(
         self,
         match: TrackMatch,
         *,
         predicted_heading_rad: float,
-        speed_mps: float,
         heading_error_jacobian: np.ndarray | None = None,
     ) -> LinearizedMapConstraint | None:
-        if abs(speed_mps) < self.minimum_speed_mps or match.ambiguous:
+        if match.ambiguous:
             return None
-        sigma = speed_dependent_heading_std_rad(
-            speed_mps,
-            minimum_std_rad=self.minimum_std_rad,
-            reference_speed_mps=self.reference_speed_mps,
-        )
         jacobian = np.zeros((1, STATE_DIM), dtype=np.float64)
         if heading_error_jacobian is None:
-            # Identity-attitude fallback retained for isolated model tests.
+            # Identity-attitude value, used by the isolated model tests.
             heading_error_jacobian = np.array([0.0, 0.0, 1.0])
         jacobian[0, ROT] = np.asarray(
             heading_error_jacobian, dtype=np.float64
@@ -113,7 +79,7 @@ class MapHeadingObservation:
                 dtype=np.float64,
             ),
             jacobian=jacobian,
-            covariance=np.array([[sigma**2]], dtype=np.float64),
+            covariance=np.array([[self.heading_std_rad**2]], dtype=np.float64),
             nis_threshold=6.6348966010212145,
         )
 
@@ -121,11 +87,15 @@ class MapHeadingObservation:
 class CrossTrackPositionConstraint:
     """Line-normal map observation ``n.T @ (p - q) = 0``.
 
-    This is equivalent to the straight-segment observation of El Najjar and
-    Bonnifait when the along-segment variance tends to infinity.  It does not
-    claim to reproduce their Belief-Theory association or map-bias states.
+    Thesis Sec. 4.5: e_perp Eq. (4.39) (computed by the matcher at the track
+    point), residual r = -e_perp Eq. (4.40), Jacobian Eq. (4.41),
+    sigma_perp and gate Eq. (5.9).
+
+    This is the straight-segment observation of El Najjar and Bonnifait (2005)
+    with infinite along-segment variance.  Their belief-theory segment
+    selection and map-bias states are not part of this implementation.
     """
-    def __init__(self, *, lateral_std_m: float = 2.0) -> None:
+    def __init__(self, *, lateral_std_m: float = 0.35) -> None:
         if lateral_std_m <= 0.0:
             raise ValueError("lateral_std_m must be positive")
         self.lateral_std_m = float(lateral_std_m)
@@ -147,40 +117,29 @@ class CrossTrackPositionConstraint:
 
 
 class CombinedCrossTrackHeadingConstraint:
-    """Thesis experiment stacking line-normal position and map heading."""
+    """Line-normal position and map heading stacked into one update.
+
+    Thesis Eq. (4.46); gate chi2(2, 0.99) = 9.2103.
+    """
 
     def __init__(
-        self,
-        *,
-        lateral_std_m: float = 2.0,
-        minimum_heading_std_deg: float = 3.0,
-        reference_speed_mps: float = 20.0,
-        minimum_speed_mps: float = 1.0,
+        self, *, lateral_std_m: float = 0.35, heading_std_deg: float = 1.0
     ) -> None:
-        self.lateral_std_m = float(lateral_std_m)
-        self.minimum_heading_std_rad = float(
-            np.deg2rad(minimum_heading_std_deg)
-        )
-        self.reference_speed_mps = float(reference_speed_mps)
-        self.minimum_speed_mps = float(minimum_speed_mps)
-        if self.lateral_std_m <= 0.0:
+        if lateral_std_m <= 0.0:
             raise ValueError("lateral_std_m must be positive")
+        self.lateral_std_m = float(lateral_std_m)
+        self.heading_std_rad = float(np.deg2rad(heading_std_deg))
 
     def linearize(
         self,
         match: TrackMatch,
         *,
         predicted_heading_rad: float,
-        speed_mps: float,
         heading_error_jacobian: np.ndarray | None = None,
     ) -> LinearizedMapConstraint | None:
-        if abs(speed_mps) < self.minimum_speed_mps or match.ambiguous:
+        if match.ambiguous:
             return None
-        heading_sigma = speed_dependent_heading_std_rad(
-            speed_mps,
-            minimum_std_rad=self.minimum_heading_std_rad,
-            reference_speed_mps=self.reference_speed_mps,
-        )
+        heading_sigma = self.heading_std_rad
         measurement_covariance = np.diag(
             [self.lateral_std_m**2, heading_sigma**2]
         )
@@ -206,9 +165,3 @@ class CombinedCrossTrackHeadingConstraint:
             nis_threshold=9.210340371976184,
         )
 
-
-# Compatibility aliases for old notebooks. New thesis text and scripts use
-# the explicit observation names above.
-HeadingConstraint = MapHeadingObservation
-LateralConstraint = CrossTrackPositionConstraint
-PoseConstraint = CombinedCrossTrackHeadingConstraint

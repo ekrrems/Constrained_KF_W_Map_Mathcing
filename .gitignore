@@ -13,5 +13,8 @@ __pycache__/
 
 outputs/
 cache
-config/
 docs/
+
+# Recording, maps and references (not distributed with the code)
+data/*
+!data/README.md

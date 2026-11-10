@@ -16,12 +16,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from sensors.map_matlab_data_obtainer import MatlabDataObtainer
-from sensors.map_show_dataset_map import read_reference_nodes
+from sensors.railway_dataset import RailwayDataset
+from sensors.reference_reader import read_reference_nodes
 from visualization.map_result_visualizer import MODE_COLORS
 
 SERIES = (
-    ("osm", "01_gnss_imu_epochs.csv", "GNSS/IMU (no map)", MODE_COLORS["gnss_imu"], "-"),
+    ("osm", "01_gnss_imu_epochs.csv", "IMU only (GNSS withheld)", MODE_COLORS["gnss_imu"], "-"),
     ("osm", "03_one_step_map_heading_epochs.csv", "OSM heading", MODE_COLORS["one_step_map_heading"], "-"),
     ("osm", "04_one_step_cross_track_epochs.csv", "OSM line normal", MODE_COLORS["one_step_cross_track"], "-"),
     ("osm", "05_one_step_combined_epochs.csv", "OSM combined", MODE_COLORS["one_step_combined"], "-"),
@@ -43,7 +43,7 @@ def main(osm_run: Path, ortho_run: Path, data_folder: Path, output: Path) -> Non
     runs = {"osm": osm_run, "ortho": ortho_run}
     data = {(src, name): read_run(runs[src] / name) for src, name, *_ in SERIES}
     t, _, _ = data[("osm", "01_gnss_imu_epochs.csv")]
-    truth = MatlabDataObtainer(
+    truth = RailwayDataset(
         data_folder, "2025_01_30", 13, apply_axis_orientation=True
     ).gnss_positions_utm_m[:, :2]
     origin = truth[0]

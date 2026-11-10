@@ -17,8 +17,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from estimation.map_reference_evaluation import ReferencePolyline
-from sensors.map_matlab_data_obtainer import MatlabDataObtainer
-from sensors.map_show_dataset_map import read_reference_nodes
+from sensors.railway_dataset import RailwayDataset
+from sensors.reference_reader import read_reference_nodes
 from visualization.map_result_visualizer import MODE_COLORS
 
 WINDOWS = (
@@ -43,10 +43,11 @@ def read_run(path: Path):
     return t - t[0], xy, covered
 
 
-def main(osm_run: Path, data_folder: Path, output: Path) -> None:
-    reference_xy = np.asarray(read_reference_nodes(data_folder / "Ref_Intermetric_UTM.txt"))
-    reference = ReferencePolyline(reference_xy)
-    gnss = MatlabDataObtainer(data_folder, "2025_01_30", 13, apply_axis_orientation=True).gnss_positions_utm_m[:, :2]
+def main(osm_run: Path, data_folder: Path, output: Path,
+         reference_file: Path | None = None, max_segment_m: float | None = None) -> None:
+    reference_xy = np.asarray(read_reference_nodes(reference_file or data_folder / "Ref_Intermetric_UTM.txt"))
+    reference = ReferencePolyline(reference_xy, max_segment_m=max_segment_m)
+    gnss = RailwayDataset(data_folder, "2025_01_30", 13, apply_axis_orientation=True).gnss_positions_utm_m[:, :2]
     series = []
     for name, label, color in SERIES:
         t, xy, covered = read_run(osm_run / name)
@@ -63,6 +64,7 @@ def main(osm_run: Path, data_folder: Path, output: Path) -> None:
     route.plot(*(reference_xy - origin).T, color="#bbbbbb", lw=3)
     along.plot(t[covered], np.abs(series[0][2][covered]), color=MODE_COLORS["gnss_imu"], lw=1.2,
                label="GNSS/IMU (no map)")
+    along.set_xlabel("Time since start [s] (the train runs from Start towards the end, A to E)")
     for tag, a, b, _ in WINDOWS:
         m = (t >= a) & (t < b)
         route.plot(*(gnss[m] - origin).T, color="#cc3311", lw=4)
@@ -72,15 +74,19 @@ def main(osm_run: Path, data_folder: Path, output: Path) -> None:
                        fontweight="bold", color="#cc3311")
         along.axvspan(a, b, color="#cc3311", alpha=0.15, lw=0)
         along.text((a + b) / 2, 0.37, tag, ha="center", fontsize=10, fontweight="bold", color="#cc3311")
+    end = gnss[min(len(gnss), len(covered)) - 1 if covered.all() else np.flatnonzero(covered)[-1]] - origin
+    route.plot(0.0, 0.0, "o", color="black", ms=6, zorder=5)
+    route.annotate("Start", (0.0, 0.0), xytext=(6, -2), textcoords="offset points", fontsize=9)
+    route.plot(*end, "s", color="black", ms=5, zorder=5)
+    route.annotate("End of reference", end, xytext=(8, 2), textcoords="offset points", fontsize=8)
     route.set_aspect("equal")
     route.set_xticks([])
     route.set_yticks([])
     route.set_title("Route and selected sections", fontsize=10)
     along.set_xlim(0, t[covered].max())
     along.set_ylim(0, 0.4)
-    along.set_xlabel("Time since start [s]")
     along.set_ylabel("Distance to reference [m]")
-    along.set_title("GNSS/IMU baseline error along the route", fontsize=10)
+    along.set_title("Error of the GNSS/IMU filter without map along the route", fontsize=10)
 
     for col, (tag, a, b, title) in enumerate(WINDOWS):
         axis = figure.add_subplot(panel_cells[col])

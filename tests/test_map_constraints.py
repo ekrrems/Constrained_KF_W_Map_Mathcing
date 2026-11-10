@@ -12,7 +12,6 @@ from estimation.map_constraint_models import (
     CombinedCrossTrackHeadingConstraint,
     CrossTrackPositionConstraint,
     MapHeadingObservation,
-    speed_dependent_heading_std_rad,
 )
 from estimation.map_reference_evaluation import ReferencePolyline
 from estimation.railway_state import RailwayESKFState
@@ -35,9 +34,8 @@ from map_matching.algorithms.map_track_matcher import (
     TrackHypothesisManager,
     TrackMatch,
 )
-from sensors.map_matlab_data_obtainer import GnssReading, ImuReading
-from sensors.kitti_raw_data import KittiRawDataObtainer
-from sensors.map_show_dataset_map import read_reference_nodes
+from sensors.railway_dataset import GnssReading, ImuReading
+from sensors.reference_reader import read_reference_nodes
 from src.experiment_engine import run_experiment
 
 
@@ -66,25 +64,19 @@ def test_constraint_names_and_18d_shapes(tmp_path) -> None:
     match = TrackDatabaseMatcher(database_path).match(np.array([10.0, 2.0]), 0.0)
     assert match is not None
     heading = MapHeadingObservation().linearize(
-        match, predicted_heading_rad=0.0, speed_mps=10.0
+        match, predicted_heading_rad=0.0
     )
     cross_track = CrossTrackPositionConstraint().linearize(match)
     combined = CombinedCrossTrackHeadingConstraint().linearize(
-        match, predicted_heading_rad=0.0, speed_mps=10.0
+        match, predicted_heading_rad=0.0
     )
     assert heading.name == "map_heading" and heading.jacobian.shape == (1, 18)
     assert cross_track.name == "cross_track_position"
     assert cross_track.jacobian.shape == (1, 18)
     assert combined.name == "combined_cross_track_heading"
     assert combined.jacobian.shape == (2, 18)
-    assert np.isclose(speed_dependent_heading_std_rad(0.0), np.pi / 2.0)
-    assert np.isclose(
-        speed_dependent_heading_std_rad(20.0), np.deg2rad(3.0)
-    )
-    assert np.isclose(
-        speed_dependent_heading_std_rad(10.0),
-        0.5 * (np.pi / 2.0 + np.deg2rad(3.0)),
-    )
+    assert np.isclose(heading.covariance[0, 0], np.deg2rad(1.0) ** 2)
+    assert np.allclose(np.diag(combined.covariance), [0.35**2, np.deg2rad(1.0) ** 2])
 
 
 def test_fixed_association_recomputes_current_state_residual(tmp_path) -> None:
@@ -150,14 +142,12 @@ def test_map_constraint_jacobians_by_finite_difference() -> None:
     heading = MapHeadingObservation().linearize(
         match,
         predicted_heading_rad=eskf.quaternion_to_yaw_rad(),
-        speed_mps=8.0,
         heading_error_jacobian=heading_jacobian,
     )
     lateral = CrossTrackPositionConstraint().linearize(match)
     combined = CombinedCrossTrackHeadingConstraint().linearize(
         match,
         predicted_heading_rad=eskf.quaternion_to_yaw_rad(),
-        speed_mps=8.0,
         heading_error_jacobian=heading_jacobian,
     )
 
@@ -335,6 +325,30 @@ def test_cross_track_update_changes_filter_state(tmp_path) -> None:
     assert eskf.state.covariance.shape == (18, 18)
 
 
+def test_frozen_tilt_map_update_keeps_roll_pitch_and_accel_bias(tmp_path) -> None:
+    database_path = tmp_path / "track.db"
+    make_track_database(database_path)
+    match = TrackDatabaseMatcher(database_path).match(np.array([10.0, 2.0]), 0.0)
+    constraint = CrossTrackPositionConstraint(lateral_std_m=1.0).linearize(match)
+    eskf = GnssImuESKF.__new__(GnssImuESKF)
+    eskf.state = RailwayESKFState(position_wb=np.array([10.0, 2.0, 0.0]))
+    # Correlate lateral position with roll and lateral accelerometer bias, as a
+    # GNSS lever arm does, so that an unfrozen update would change them.
+    covariance = eskf.state.covariance
+    covariance[4, 0] = covariance[0, 4] = 0.5 * np.sqrt(covariance[4, 4] * covariance[0, 0])
+    covariance[4, 13] = covariance[13, 4] = 0.5 * np.sqrt(covariance[4, 4] * covariance[13, 13])
+    eskf.map_updates_accepted = {}
+    eskf.map_updates_rejected = {}
+    eskf.freeze_tilt_in_map_updates()
+    quaternion_before = eskf.state.quaternion_wb.copy()
+    result = eskf.apply_map_constraint(constraint)
+    assert result.accepted
+    assert 0.0 < eskf.state.position_wb[1] < 2.0
+    assert np.allclose(eskf.state.quaternion_wb, quaternion_before)
+    assert np.allclose(eskf.state.accel_bias, 0.0)
+    assert np.all(np.linalg.eigvalsh(eskf.state.covariance) > -1e-12)
+
+
 def test_joint_gnss_update_constrains_velocity() -> None:
     eskf = GnssImuESKF.__new__(GnssImuESKF)
     eskf.state = RailwayESKFState(
@@ -458,11 +472,9 @@ def test_fixed_association_schedule_replays_baseline_decisions(tmp_path) -> None
     data = TinyData()
     source = run_experiment(
         data, matcher, mode="two_step", gnss_dimensions=3,
-        imu_body_frame="flu",
     )
     replay = run_experiment(
         data, matcher, mode="one_step_cross_track", gnss_dimensions=3,
-        imu_body_frame="flu",
         association_schedule=source["association_schedule"],
     )
     assert np.array_equal(source["selected_way_id"], replay["selected_way_id"])
@@ -472,28 +484,6 @@ def test_fixed_association_schedule_replays_baseline_decisions(tmp_path) -> None
     assert np.array_equal(
         source["association_valid"], replay["association_valid"]
     )
-
-
-def test_geojson_is_projected_to_utm(tmp_path) -> None:
-    if importlib.util.find_spec("pyproj") is None:
-        return
-    from pyproj import Transformer
-    path = tmp_path / "roads.geojson"
-    coordinates = [[8.39, 48.98], [8.391, 48.98]]
-    path.write_text(json.dumps({"type": "FeatureCollection", "features": [{
-        "type": "Feature", "properties": {},
-        "geometry": {"type": "LineString", "coordinates": coordinates},
-    }]}), encoding="utf-8")
-    transformer = Transformer.from_crs("EPSG:4326", "EPSG:32632", always_xy=True)
-    start = np.asarray(transformer.transform(*coordinates[0]))
-    end = np.asarray(transformer.transform(*coordinates[1]))
-    tangent = (end - start) / np.linalg.norm(end - start)
-    normal = np.array([-tangent[1], tangent[0]])
-    match = TrackDatabaseMatcher(path).match(
-        0.5 * (start + end) + 2.0 * normal,
-        float(np.arctan2(tangent[1], tangent[0])),
-    )
-    assert match is not None and np.isclose(match.distance_m, 2.0, atol=0.05)
 
 
 def test_reference_distance_and_three_column_reader(tmp_path) -> None:
@@ -514,94 +504,3 @@ def test_reference_distance_and_three_column_reader(tmp_path) -> None:
         np.array([[5.0, 0.1], [-0.2, 0.0], [10.0, 10.2]])
     )
     assert np.array_equal(coverage, [True, False, False])
-
-
-def test_kitti_reader_keeps_fused_velocity_out_of_gnss_update(tmp_path) -> None:
-    archive_path = tmp_path / "tiny_kitti.zip"
-    prefix = "2011_10_03/2011_10_03_drive_0027_sync/oxts/"
-    packet_0 = np.zeros(30)
-    packet_1 = np.zeros(30)
-    for packet, latitude, longitude in (
-        (packet_0, 48.98, 8.39), (packet_1, 48.980001, 8.390001)
-    ):
-        packet[0:3] = [latitude, longitude, 250.0]
-        packet[6:8] = [4.0, 5.0]  # north, east
-        packet[10] = 0.25  # up
-        packet[23] = 0.8  # position accuracy
-        packet[24] = 0.2  # velocity accuracy
-        packet[27] = 4  # navigation mode
-    timestamps = (
-        "2011-10-03 12:00:00.000000000\n"
-        "2011-10-03 12:00:00.100000000\n"
-    )
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr(prefix + "timestamps.txt", timestamps)
-        for index, packet in enumerate((packet_0, packet_1)):
-            archive.writestr(
-                prefix + f"data/{index:010d}.txt",
-                " ".join(str(value) for value in packet) + "\n",
-            )
-
-    data = KittiRawDataObtainer(
-        archive_path, "2011_10_03", "0027", gnss_stride=2
-    )
-    try:
-        first = data.gnss_reading(0)
-        withheld = data.gnss_reading(1)
-        assert np.allclose(first.velocity_utm_mps, [5.0, 4.0, 0.25])
-        assert np.allclose(np.diag(first.velocity_covariance_m2ps2), 0.2**2)
-        assert first.mode == 4 and not first.velocity_valid
-        assert withheld.mode == -1 and not withheld.velocity_valid
-    finally:
-        data.close()
-
-
-def test_kitti_reader_combines_sync_gnss_with_extract_imu(tmp_path) -> None:
-    sync = tmp_path / "2011_10_03_drive_0027_sync"
-    extract = tmp_path / "2011_10_03_drive_0027_extract"
-    (sync / "oxts" / "data").mkdir(parents=True)
-    (extract / "oxts" / "data").mkdir(parents=True)
-
-    base_packet = np.zeros(30)
-    base_packet[0:3] = [48.98, 8.39, 250.0]
-    base_packet[6:8] = [4.0, 5.0]
-    base_packet[23:25] = [0.8, 0.2]
-    base_packet[27] = 4
-
-    sync_times = []
-    for index, fraction in enumerate((0.0, 0.1, 0.2)):
-        sync_times.append(f"2011-10-03 12:00:00.{int(fraction * 1e9):09d}")
-        packet = base_packet.copy()
-        packet[1] += index * 1.0e-6
-        (sync / "oxts" / "data" / f"{index:010d}.txt").write_text(
-            " ".join(str(value) for value in packet) + "\n", encoding="utf-8"
-        )
-    (sync / "oxts" / "timestamps.txt").write_text(
-        "\n".join(sync_times) + "\n", encoding="utf-8"
-    )
-
-    extract_times = []
-    for index in range(21):
-        extract_times.append(f"2011-10-03 12:00:00.{index * 10_000_000:09d}")
-        packet = base_packet.copy()
-        packet[11] = 0.01 * index
-        (extract / "oxts" / "data" / f"{index:010d}.txt").write_text(
-            " ".join(str(value) for value in packet) + "\n", encoding="utf-8"
-        )
-    (extract / "oxts" / "timestamps.txt").write_text(
-        "\n".join(extract_times) + "\n", encoding="utf-8"
-    )
-
-    data = KittiRawDataObtainer(
-        sync, "2011_10_03", "0027", imu_source=extract
-    )
-    try:
-        assert len(data.gnss_timestamps) == 3
-        assert len(data.imu_timestamps) == 21
-        assert np.isclose(data.imu_metadata.sampling_rate_hz, 100.0)
-        assert np.isclose(data.gnss_metadata.sampling_rate_hz, 10.0)
-        readings = list(data)
-        assert sum(type(item).__name__ == "ImuReading" for item in readings) == 21
-        assert sum(type(item).__name__ == "GnssReading" for item in readings) == 3
-    finally:
-        data.close()

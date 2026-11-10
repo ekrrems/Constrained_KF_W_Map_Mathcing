@@ -64,6 +64,7 @@ class AngleStatistics:
 
 
 def heading_errors_deg(estimated_heading_deg: np.ndarray, oriented_tangents: np.ndarray) -> np.ndarray:
+    """Thesis Eq. (6.2): wrap(psi_hat - atan2(t_N, t_E))."""
     reference_deg = np.rad2deg(np.arctan2(oriented_tangents[:, 1], oriented_tangents[:, 0]))
     return wrap_deg(np.asarray(estimated_heading_deg) - reference_deg)
 
@@ -111,7 +112,8 @@ def along_cross_errors(
     oriented_tangents: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Horizontal error and along-track error against the truth, cross-track
-    error as distance to the reference."""
+    error as distance to the reference (thesis Eq. 6.3-6.5; the outage
+    evaluation passes the GNSS path as reference and the antenna as estimate)."""
     estimated_xy = np.asarray(estimated_xy, dtype=np.float64)
     truth_xy = np.asarray(truth_xy, dtype=np.float64)
     error = estimated_xy - truth_xy

@@ -9,27 +9,27 @@ import numpy as np
 
 @dataclass(frozen=True)
 class DistanceStatistics:
-    count: int
-    mean_m: float
-    median_m: float
-    rmse_m: float
-    percentile_95_m: float
-    maximum_m: float
+	count: int
+	mean_m: float
+	median_m: float
+	rmse_m: float
+	percentile_95_m: float
+	maximum_m: float
 
-    @classmethod
-    def from_distances(cls, distances_m: np.ndarray) -> "DistanceStatistics":
-        values = np.asarray(distances_m, dtype=np.float64).reshape(-1)
-        values = values[np.isfinite(values)]
-        if values.size == 0:
-            return cls(0, np.nan, np.nan, np.nan, np.nan, np.nan)
-        return cls(
-            count=int(values.size),
-            mean_m=float(np.mean(values)),
-            median_m=float(np.median(values)),
-            rmse_m=float(np.sqrt(np.mean(values**2))),
-            percentile_95_m=float(np.percentile(values, 95.0)),
-            maximum_m=float(np.max(values)),
-        )
+	@classmethod
+	def from_distances(cls, distances_m: np.ndarray) -> "DistanceStatistics":
+		values = np.asarray(distances_m, dtype=np.float64).reshape(-1)
+		values = values[np.isfinite(values)]
+		if values.size == 0:
+			return cls(0, np.nan, np.nan, np.nan, np.nan, np.nan)
+		return cls(
+			count=int(values.size),
+			mean_m=float(np.mean(values)),
+			median_m=float(np.median(values)),
+			rmse_m=float(np.sqrt(np.mean(values**2))),
+			percentile_95_m=float(np.percentile(values, 95.0)),
+			maximum_m=float(np.max(values)),
+		)
 
 
 @dataclass(frozen=True)
@@ -72,7 +72,8 @@ class SignedDistanceStatistics:
 class ReferencePolyline:
     """Piecewise-linear reference trajectory in projected UTM coordinates."""
 
-    def __init__(self, points_xy: np.ndarray) -> None:
+    def __init__(self, points_xy: np.ndarray, *, max_segment_m: float | None = None) -> None:
+        """``max_segment_m`` treats longer chords as gaps (digitized polylines)."""
         points = np.asarray(points_xy, dtype=np.float64).reshape(-1, 2)
         if len(points) < 2:
             raise ValueError("The reference trajectory needs at least two points")
@@ -80,12 +81,21 @@ class ReferencePolyline:
         vectors = points[1:] - starts
         lengths_squared = np.einsum("ij,ij->i", vectors, vectors)
         valid = lengths_squared > 1.0e-12
+        if max_segment_m is not None:
+            valid &= lengths_squared <= max_segment_m**2
         if not np.any(valid):
             raise ValueError("The reference trajectory contains no valid segments")
         self.points_xy = points
         self.segment_starts = starts[valid]
         self.segment_vectors = vectors[valid]
         self.segment_lengths_squared = lengths_squared[valid]
+        # A segment end is free when the next (or previous) kept segment does
+        # not start (end) there: a gap or a global end of the polyline.
+        kept = np.flatnonzero(valid)
+        contiguous = np.diff(kept) == 1
+        self.free_start = np.r_[True, ~contiguous]
+        self.free_end = np.r_[~contiguous, True]
+        self.has_gaps = bool(np.any(~contiguous))
 
     def closest_point_and_distance(
         self, position_xy: np.ndarray
@@ -157,12 +167,9 @@ class ReferencePolyline:
         best = int(np.argmin(distances_squared))
         segment_length = float(np.sqrt(self.segment_lengths_squared[best]))
         fraction_tolerance = tolerance_m / segment_length
-        if best == 0 and unbounded_fractions[best] < -fraction_tolerance:
+        if self.free_start[best] and unbounded_fractions[best] < -fraction_tolerance:
             return False
-        if (
-            best == len(self.segment_starts) - 1
-            and unbounded_fractions[best] > 1.0 + fraction_tolerance
-        ):
+        if self.free_end[best] and unbounded_fractions[best] > 1.0 + fraction_tolerance:
             return False
         return True
 
@@ -206,6 +213,9 @@ class ReferencePolyline:
     ) -> np.ndarray:
         """Return a common evaluation mask based on reference coverage.
 
+        Thesis Eq. (5.15): d_ref(z_g) <= 20 m, plus no extrapolation beyond
+        the reference end points.
+
         The mask must be computed from one fixed probe trajectory (here raw
         GNSS), then reused for every estimator mode.  Computing a separate mask
         from each estimate would unfairly discard the largest errors.
@@ -216,8 +226,9 @@ class ReferencePolyline:
             reference_probe_positions_xy, dtype=np.float64
         ).reshape(-1, 2)
         close_enough = self.distances(probes) <= maximum_distance_m
+        tolerance = 1.0 if self.has_gaps else 1.0e-6
         longitudinally_covered = np.fromiter(
-            (self.is_within_longitudinal_coverage(point) for point in probes),
+            (self.is_within_longitudinal_coverage(point, tolerance_m=tolerance) for point in probes),
             dtype=bool,
             count=len(probes),
         )
@@ -232,7 +243,10 @@ def block_bootstrap_rmse_interval(
     confidence: float = 0.95,
     seed: int = 20261107,
 ) -> tuple[float, float]:
-    """Moving-block bootstrap interval for RMSE of correlated epochs."""
+    """Moving-block bootstrap interval for RMSE of correlated epochs.
+
+    Thesis Sec. 6.3: blocks of 20 epochs, 2000 repetitions, 95 % interval.
+    """
     values = np.asarray(errors_m, dtype=np.float64).reshape(-1)
     values = values[np.isfinite(values)]
     if values.size == 0:

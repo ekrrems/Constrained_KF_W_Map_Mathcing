@@ -1,20 +1,21 @@
-"""Road association against either an OSM GeoJSON or the MATLAB ``track.db``.
+"""Track association against the OSM track database or an orthophoto polyline.
 
 Both inputs are normalized to the same array of metric line segments.  The
 matcher then projects a predicted position onto every segment and scores the
 candidates using cross-track distance and bidirectional heading agreement.
-The instantaneous score follows the two-term position/heading Mahalanobis
-criterion described by Fouque, Bonnifait, and Betaille (PLANS 2008).  Temporal
-hypotheses are retained conservatively, but this module is not Heirich's RBPF:
-it does not maintain a separate navigation state inside every particle.
+The instantaneous score adds a normalized squared distance and a normalized
+squared heading difference, the two cues used in classical map matching
+(Quddus et al., 2007).  A small set of track hypotheses is carried over time
+with a transition cost; unlike Heirich's particle filter it does not keep a
+separate navigation state for every hypothesis.
 """
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 
@@ -34,19 +35,14 @@ class TrackMatch:
 
 
 class TrackDatabaseMatcher:
-    """Vectorized matcher for GeoJSON road geometry or a SQLite track map.
-
-    The historical class name is retained so the MATLAB-data scripts remain
-    backwards compatible.  ``map_path`` may now be either ``.db``/``.sqlite``
-    or ``.geojson``/``.json``.  Geographic GeoJSON is projected to
-    ``target_crs`` before any metric distance is evaluated.
-    """
+    """Vectorized matcher for the OSM track database (``.db``) or a text polyline."""
 
     def __init__(
         self,
         map_path: Path,
         *,
         target_crs: str = "EPSG:32632",
+        travel_lateral_offset_m: float = 0.0,
         maximum_distance_m: float = 30.0,
         nominal_map_distance_sigma_m: float = 2.0,
         nominal_map_heading_sigma_deg: float = 10.0,
@@ -64,6 +60,9 @@ class TrackDatabaseMatcher:
         self.database_path = self.map_path
         self.target_crs = str(target_crs)
         self.maximum_distance_m = float(maximum_distance_m)
+        # Map line moved to the left (+) or right (-) of the direction of travel,
+        # e.g. from the OSM centre line onto the left rail.
+        self.travel_lateral_offset_m = float(travel_lateral_offset_m)
         self.nominal_map_distance_sigma_m = float(nominal_map_distance_sigma_m)
         self.nominal_map_heading_sigma_rad = float(
             np.deg2rad(nominal_map_heading_sigma_deg)
@@ -87,9 +86,6 @@ class TrackDatabaseMatcher:
         if not self.map_path.is_file():
             raise FileNotFoundError(f"Map source not found: {self.map_path}")
         suffix = self.map_path.suffix.lower()
-        if suffix in {".geojson", ".json"}:
-            self._load_geojson_segments()
-            return
         if suffix in {".db", ".sqlite", ".sqlite3"}:
             self._load_sqlite_segments()
             return
@@ -97,8 +93,7 @@ class TrackDatabaseMatcher:
             self._load_polyline_segments()
             return
         raise ValueError(
-            f"Unsupported map source {self.map_path}; use GeoJSON, SQLite, "
-            "or a projected text polyline"
+            f"Unsupported map source {self.map_path}; use SQLite (.db) or a text polyline"
         )
 
     @staticmethod
@@ -119,8 +114,6 @@ class TrackDatabaseMatcher:
 
     def _load_polyline_segments(self) -> None:
         """Load a projected text polyline (last two columns: easting, northing)."""
-        import re
-
         points: list[tuple[float, float]] = []
         with self.map_path.open("r", encoding="utf-8", errors="replace") as stream:
             for line in stream:
@@ -202,50 +195,7 @@ class TrackDatabaseMatcher:
             previous_point = point
         self._set_segments(starts, ends, way_ids, segment_indices)
 
-    def _load_geojson_segments(self) -> None:
-        try:
-            import geopandas as gpd
-        except ImportError as exc:
-            raise ImportError("GeoJSON map input requires geopandas") from exc
-
-        roads = gpd.read_file(self.map_path)
-        if roads.empty:
-            raise ValueError(f"No road features found in {self.map_path}")
-        if roads.crs is None:
-            roads = roads.set_crs("EPSG:4326")
-        roads_metric = roads.to_crs(self.target_crs)
-
-        starts: list[np.ndarray] = []
-        ends: list[np.ndarray] = []
-        way_ids: list[int] = []
-        segment_indices: list[int] = []
-        for feature_index, geometry in enumerate(roads_metric.geometry):
-            if geometry is None or geometry.is_empty:
-                continue
-            if geometry.geom_type == "LineString":
-                lines: Iterable = (geometry,)
-            elif geometry.geom_type == "MultiLineString":
-                lines = geometry.geoms
-            else:
-                continue
-            segment_index = 0
-            # Feature index is intentionally used as the way identifier.  OSM
-            # ``osmid`` may be a scalar, string, or list after simplification.
-            way_id = int(feature_index + 1)
-            for line in lines:
-                coordinates = np.asarray(line.coords, dtype=np.float64)[:, :2]
-                for point_index in range(len(coordinates) - 1):
-                    start = coordinates[point_index]
-                    end = coordinates[point_index + 1]
-                    if np.linalg.norm(end - start) <= 1.0e-6:
-                        continue
-                    starts.append(start.copy())
-                    ends.append(end.copy())
-                    way_ids.append(way_id)
-                    segment_indices.append(segment_index)
-                    segment_index += 1
-        self._set_segments(starts, ends, way_ids, segment_indices)
-
+    # Thesis Eq. (5.5): stored segment fields (a, b, s, l^2, t, way, index).
     def _set_segments(
         self,
         starts: list[np.ndarray],
@@ -332,10 +282,10 @@ class TrackDatabaseMatcher:
                 1.0,
             )
         )
-        closest = start + fraction * vector
         tangent = np.asarray(template.tangent_xy, dtype=np.float64).reshape(2)
         tangent /= np.linalg.norm(tangent)
         normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+        closest = start + fraction * vector + self.travel_lateral_offset_m * normal
         residual = position - closest
         return replace(
             template,
@@ -357,6 +307,7 @@ class TrackDatabaseMatcher:
         maximum_candidates: int = 8,
     ) -> list[TrackMatch]:
         """Return ranked segment candidates without collapsing ambiguity."""
+        # Thesis Eq. (4.25)-(4.29): finite-segment projection u, c, d.
         position = np.asarray(position_xy, dtype=np.float64).reshape(2)
         relative = position - self.segment_starts
         fractions = np.einsum("ij,ij->i", relative, self.segment_vectors)
@@ -374,6 +325,7 @@ class TrackDatabaseMatcher:
         else:
             free_end = np.zeros(len(distances_squared), dtype=bool)
 
+        # Thesis Eq. (4.30)-(4.33): bidirectional heading difference.
         raw_headings = np.arctan2(
             self.segment_tangents[:, 1], self.segment_tangents[:, 0]
         )
@@ -388,6 +340,7 @@ class TrackDatabaseMatcher:
                 position_covariance_xy, dtype=np.float64
             ).reshape(2, 2)
             position_variance = max(0.0, float(np.linalg.eigvalsh(covariance_xy)[-1]))
+        # Thesis Eq. (4.34)-(4.36): inflated variances and score J_i.
         distance_variance = self.nominal_map_distance_sigma_m**2 + position_variance
         heading_variance = (
             self.nominal_map_heading_sigma_rad**2
@@ -401,11 +354,13 @@ class TrackDatabaseMatcher:
             distance = float(np.sqrt(distances_squared[candidate_index]))
             if distance > self.maximum_distance_m or free_end[candidate_index]:
                 continue
+            # Tangent turned to the direction of travel; n = [-t_y, t_x]
+            # (Eq. 4.29); e_perp = n^T (p - c) is Eq. (4.39).
             tangent = self.segment_tangents[candidate_index].copy()
             if reverse_errors[candidate_index] < forward_errors[candidate_index]:
                 tangent = -tangent
             normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
-            closest = projections[candidate_index].copy()
+            closest = projections[candidate_index] + self.travel_lateral_offset_m * normal
             matches.append(
                 TrackMatch(
                     way_id=int(self.way_ids[candidate_index]),
@@ -514,6 +469,7 @@ class TrackHypothesisManager:
             self.reset()
             return None
 
+        # Thesis Eq. (4.37): C_j(k) = J_j(k) + min_i (C_i(k-1) + pi_ij).
         scored: list[tuple[TrackMatch, float]] = []
         if not self._hypotheses:
             scored = [(candidate, candidate.score) for candidate in candidates]
@@ -549,6 +505,7 @@ class TrackHypothesisManager:
             if likelihood_sum > 0.0 and np.isfinite(likelihood_sum)
             else np.full(len(likelihoods), 1.0 / len(likelihoods))
         )
+        # Thesis Eq. (4.38): ambiguity test with Delta C_min = 2.
         best, normalized_best = self._hypotheses[0]
         ambiguous = any(
             candidate.way_id != best.way_id

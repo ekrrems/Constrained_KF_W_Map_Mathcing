@@ -12,12 +12,12 @@ from visualization.map_result_visualizer import MODE_COLORS
 
 
 MODE_LABELS = {
-    "raw_gnss": "Recorded GNSS positions (unfiltered)",
+    "raw_gnss": "Recorded GNSS positions",
     "gnss_imu": "GNSS/IMU ESKF",
     "two_step": "Two-step output projection",
-    "one_step_map_heading": "Fouque-style map-heading observation",
-    "one_step_cross_track": "Direct line-normal coordinate constraint",
-    "one_step_combined": "Combined lateral-position + heading update",
+    "one_step_map_heading": "Map-heading observation",
+    "one_step_cross_track": "Line-normal constraint",
+    "one_step_combined": "Combined lateral position and heading",
 }
 
 
